@@ -1,0 +1,6 @@
+Zstandard (zstd) — Facebook
+License: BSD License / GPLv2 dual license
+Source: https://github.com/facebook/zstd (v1.5.5 single-file decoder amalgamation)
+
+Used to decompress modern Anki `.apkg` databases (`collection.anki21b`),
+including AnKing / AnkiHub exports.

@@ -1,0 +1,18 @@
+# Xcode user-specific
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# Build
+build/
+DerivedData/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Misc
+.DS_Store
+*.moved-aside
+*.swp
+*~.nib
