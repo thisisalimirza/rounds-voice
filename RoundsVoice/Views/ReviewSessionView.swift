@@ -5,6 +5,7 @@ struct ReviewSessionView: View {
     let deck: Deck
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.scenePhase) private var scenePhase
     @State private var viewModel: ReviewSessionViewModel
     @State private var draftAnswer = ""
     @State private var showBridge = false
@@ -72,6 +73,13 @@ struct ReviewSessionView: View {
         .statusBarHidden(false)
         .onAppear { viewModel.start() }
         .onDisappear { viewModel.stop() }
+        .onChange(of: scenePhase) { _, phase in
+            // Locking goes to .inactive/.background — keep reviewing.
+            // Only re-assert when becoming active again (unlock / return).
+            if phase == .active {
+                viewModel.reassertAfterBecomingActive()
+            }
+        }
         .alert(
             "Permissions needed",
             isPresented: Binding(
@@ -257,6 +265,16 @@ struct ReviewSessionView: View {
     private var controls: some View {
         HStack(spacing: 10) {
             control("Repeat", "arrow.counterclockwise", viewModel.repeatQuestion)
+            control(
+                viewModel.isSuspended ? "Resume" : "Pause",
+                viewModel.isSuspended ? "play.fill" : "pause.fill"
+            ) {
+                if viewModel.isSuspended {
+                    viewModel.resumeSession()
+                } else {
+                    viewModel.pauseSession()
+                }
+            }
             control("Skip", "forward.fill", viewModel.skip)
             control("Pass", "questionmark", viewModel.markDontKnow)
         }
@@ -283,8 +301,22 @@ struct ReviewSessionView: View {
             }
         }
         .buttonStyle(.plain)
-        .disabled(viewModel.status == .finished || viewModel.status == .speaking || viewModel.status == .thinking)
-        .opacity(viewModel.status == .finished || viewModel.status == .speaking || viewModel.status == .thinking ? 0.4 : 1)
+        .disabled(
+            title == "Pause" || title == "Resume"
+                ? (viewModel.status == .finished || viewModel.status == .thinking)
+                : (viewModel.status == .finished
+                    || viewModel.status == .speaking
+                    || viewModel.status == .thinking)
+        )
+        .opacity(
+            (
+                title == "Pause" || title == "Resume"
+                    ? (viewModel.status == .finished || viewModel.status == .thinking)
+                    : (viewModel.status == .finished
+                        || viewModel.status == .speaking
+                        || viewModel.status == .thinking)
+            ) ? 0.4 : 1
+        )
     }
 
     private var statusTint: Color {

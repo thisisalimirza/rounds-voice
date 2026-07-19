@@ -143,8 +143,17 @@ struct AnkiDeckImporter: DeckImporter {
         let extractDir = tempRoot.appendingPathComponent("extracted", isDirectory: true)
         try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
 
+        // Only pull collection DBs — AnKing media can be gigabytes and isn't needed for voice.
         do {
-            try ZipArchive.extract(archiveURL: localPackage, to: extractDir)
+            try ZipArchive.extract(
+                archiveURL: localPackage,
+                to: extractDir,
+                onlyFileNames: [
+                    "collection.anki21b",
+                    "collection.anki21",
+                    "collection.anki2"
+                ]
+            )
         } catch let error as DeckImportError {
             throw error
         } catch {
@@ -165,11 +174,18 @@ struct AnkiDeckImporter: DeckImporter {
         )
 
         guard !mapped.notes.isEmpty else {
+            let types = mapped.noteTypeCounts
+                .sorted { $0.value > $1.value }
+                .prefix(5)
+                .map { "\($0.key): \($0.value)" }
+                .joined(separator: ", ")
             throw DeckImportError.noVoiceSuitableCards(
                 .init(
                     message: """
                     No voice-suitable cards found in “\(collection.primaryDeckName)”. \
-                    \(report.summary). Image Occlusion cards can't be reviewed by voice.
+                    \(report.summary). \
+                    Note types seen: \(types.isEmpty ? "none" : types). \
+                    Image Occlusion can't be reviewed by voice; if everything else was marked empty, field mapping failed — try re-exporting the .apkg from a current Anki (media optional).
                     """
                 )
             )
@@ -214,30 +230,88 @@ struct AnkiDeckImporter: DeckImporter {
             }
         }
 
-        guard let sourceName = preferredNames.first(where: { found[$0] != nil }),
-              let sourceURL = found[sourceName]
-        else {
+        guard !found.isEmpty else {
             throw DeckImportError.parsingFailed(
                 "No collection.anki21b / collection.anki2 found in package."
             )
         }
 
-        let data = try Data(contentsOf: sourceURL)
-        if ZstdDecompressor.isZstd(data) {
-            let decoded = try ZstdDecompressor.decompress(data)
-            let outURL = directory.appendingPathComponent("collection.decoded.sqlite")
-            try decoded.write(to: outURL, options: .atomic)
-            return outURL
+        // Prefer modern payloads; never fall back to the tiny stub `.anki2` when a newer
+        // collection file exists but failed to decode.
+        let candidates = preferredNames.compactMap { name -> (String, URL)? in
+            guard let url = found[name] else { return nil }
+            return (name, url)
         }
 
-        // Avoid the tiny compatibility stub when a real anki21b exists but failed detection.
-        if sourceName == "collection.anki2", found["collection.anki21b"] != nil {
+        var lastError: String?
+        for (name, url) in candidates {
+            // Skip the legacy stub whenever a modern file is also present.
+            if name == "collection.anki2",
+               found["collection.anki21b"] != nil || found["collection.anki21"] != nil {
+                continue
+            }
+
+            do {
+                return try decodeCollectionFile(named: name, at: url, into: directory)
+            } catch let error as DeckImportError {
+                lastError = error.errorDescription
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+
+        throw DeckImportError.parsingFailed(
+            lastError ?? "Couldn't decode any collection database in the package."
+        )
+    }
+
+    private func decodeCollectionFile(named sourceName: String, at sourceURL: URL, into directory: URL) throws -> URL {
+        let attrs = try FileManager.default.attributesOfItem(atPath: sourceURL.path)
+        let fileSize = attrs[.size] as? NSNumber ?? 0
+        let data = try Data(contentsOf: sourceURL, options: [.mappedIfSafe])
+        let sqliteMagic = Data("SQLite format 3".utf8)
+
+        if data.isEmpty || fileSize.intValue == 0 {
             throw DeckImportError.parsingFailed(
-                "Found collection.anki21b but couldn't decompress it (zstd)."
+                "\(sourceName) is empty (0 bytes) after unzip — ZIP64 / extract failed."
             )
         }
 
-        return sourceURL
+        if ZstdDecompressor.isZstd(data) {
+            let outURL = directory.appendingPathComponent("collection.decoded.sqlite")
+            try ZstdDecompressor.decompressToFile(data, destination: outURL)
+            // Validate header without loading the whole DB into RAM.
+            let handle = try FileHandle(forReadingFrom: outURL)
+            defer { try? handle.close() }
+            let header = try handle.read(upToCount: 16) ?? Data()
+            guard header.starts(with: sqliteMagic) else {
+                throw DeckImportError.parsingFailed(
+                    "Decompressed \(sourceName) is not a SQLite database."
+                )
+            }
+            let size = (try? FileManager.default.attributesOfItem(atPath: outURL.path)[.size] as? NSNumber)?
+                .intValue ?? 0
+            if size < 4_096 {
+                throw DeckImportError.parsingFailed(
+                    "Decompressed \(sourceName) is suspiciously small (\(size) bytes)."
+                )
+            }
+            return outURL
+        }
+
+        if data.starts(with: sqliteMagic) {
+            if data.count < 4_096, sourceName != "collection.anki2" {
+                throw DeckImportError.parsingFailed(
+                    "\(sourceName) SQLite is suspiciously small (\(data.count) bytes)."
+                )
+            }
+            return sourceURL
+        }
+
+        let hex = data.prefix(4).map { String(format: "%02x", $0) }.joined()
+        throw DeckImportError.parsingFailed(
+            "\(sourceName) is neither zstd nor SQLite (size \(data.count), first bytes: \(hex))."
+        )
     }
 }
 
@@ -259,51 +333,118 @@ struct SampleDeckImporter: DeckImporter {
 // MARK: - Persistence
 
 enum DeckPersistence {
+    /// Small decks / samples.
     @MainActor
     static func persist(_ imported: ImportedDeck, into context: ModelContext) throws -> Deck {
+        try persistBatched(imported, into: context, batchSize: 500, onProgress: nil)
+    }
+
+    /// Persist in batches so a full AnKing import doesn't get jetsam'd (signal 9).
+    @MainActor
+    static func persist(
+        _ imported: ImportedDeck,
+        into context: ModelContext,
+        batchSize: Int,
+        onProgress: ((Int, Int) -> Void)?
+    ) async throws -> Deck {
         let deck = Deck(
             name: imported.name,
             deckDescription: imported.description,
             source: imported.source
         )
+        context.insert(deck)
 
-        for note in imported.notes {
-            let cards: [Card]
-            if note.cardType == .cloze || ClozeParser.containsCloze(note.front) {
-                cards = ClozeParser.expandToCards(
-                    noteText: note.front,
-                    back: note.back,
-                    tags: note.tags,
-                    deckName: imported.name,
-                    ankiNoteId: note.ankiNoteId,
-                    oneByOne: note.oneByOne
-                )
-            } else {
-                cards = [
-                    Card(
-                        front: note.front,
-                        back: note.back,
-                        tags: note.tags,
-                        deckName: imported.name,
-                        imageAttachments: note.imageAttachments,
-                        cardType: .basic,
-                        ankiNoteId: note.ankiNoteId
-                    )
-                ]
+        let total = imported.notes.count
+        var index = 0
+        while index < total {
+            let end = min(index + max(batchSize, 1), total)
+            try autoreleasepool {
+                for note in imported.notes[index..<end] {
+                    append(note: note, to: deck, importedName: imported.name, context: context)
+                }
+                try context.save()
             }
-
-            for card in cards {
-                card.imageAttachments = note.imageAttachments
-                card.deck = deck
-                deck.cards.append(card)
-            }
+            index = end
+            onProgress?(index, total)
+            await Task.yield()
         }
 
         guard !deck.cards.isEmpty else {
             throw DeckImportError.emptyDeck
         }
-
-        context.insert(deck)
         return deck
+    }
+
+    @MainActor
+    private static func persistBatched(
+        _ imported: ImportedDeck,
+        into context: ModelContext,
+        batchSize: Int,
+        onProgress: ((Int, Int) -> Void)?
+    ) throws -> Deck {
+        let deck = Deck(
+            name: imported.name,
+            deckDescription: imported.description,
+            source: imported.source
+        )
+        context.insert(deck)
+
+        let total = imported.notes.count
+        var index = 0
+        while index < total {
+            let end = min(index + max(batchSize, 1), total)
+            try autoreleasepool {
+                for note in imported.notes[index..<end] {
+                    append(note: note, to: deck, importedName: imported.name, context: context)
+                }
+                try context.save()
+            }
+            index = end
+            onProgress?(index, total)
+        }
+
+        guard !deck.cards.isEmpty else {
+            throw DeckImportError.emptyDeck
+        }
+        return deck
+    }
+
+    @MainActor
+    private static func append(
+        note: ImportedNote,
+        to deck: Deck,
+        importedName: String,
+        context: ModelContext
+    ) {
+        let cards: [Card]
+        if note.cardType == .cloze || ClozeParser.containsCloze(note.front) {
+            cards = ClozeParser.expandToCards(
+                noteText: note.front,
+                back: note.back,
+                tags: note.tags,
+                deckName: importedName,
+                ankiNoteId: note.ankiNoteId,
+                oneByOne: note.oneByOne
+            )
+        } else {
+            cards = [
+                Card(
+                    front: note.front,
+                    back: note.back,
+                    tags: note.tags,
+                    deckName: importedName,
+                    imageAttachments: note.imageAttachments,
+                    cardType: .basic,
+                    ankiNoteId: note.ankiNoteId
+                )
+            ]
+        }
+
+        for card in cards {
+            card.imageAttachments = note.imageAttachments
+            card.deck = deck
+            deck.cards.append(card)
+            context.insert(card)
+        }
     }
 }

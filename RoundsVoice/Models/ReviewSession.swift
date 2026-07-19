@@ -42,12 +42,25 @@ enum ReviewSessionStatus: String, Sendable, Equatable {
         switch self {
         case .idle: return "Ready"
         case .speaking: return "Speaking…"
-        case .listening: return "Listening…"
+        case .listening: return "Speak now"
         case .thinking: return "Thinking…"
         case .correct: return "Correct"
         case .incorrect: return "Incorrect"
         case .paused: return "Paused"
         case .finished: return "Session complete"
+        }
+    }
+
+    var activityPhase: ReviewActivityAttributes.ContentState.Phase {
+        switch self {
+        case .idle: return .idle
+        case .speaking: return .speaking
+        case .listening: return .listening
+        case .thinking: return .thinking
+        case .correct: return .correct
+        case .incorrect: return .incorrect
+        case .paused: return .paused
+        case .finished: return .finished
         }
     }
 }

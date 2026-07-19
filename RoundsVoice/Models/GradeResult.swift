@@ -39,7 +39,7 @@ struct GradeResult: Sendable, Equatable {
         score: 0
     )
 
-    static let unknown = GradeResult(
+            static let unknown = GradeResult(
         isCorrect: false,
         confidence: 1,
         feedback: "Marked as don't know.",

@@ -31,33 +31,38 @@ struct AnkiCollectionReader: Sendable {
     }
 
     static func load(databaseURL: URL) throws -> Collection {
-        var db: OpaquePointer?
-        let path = databaseURL.path
-        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db else {
-            throw DeckImportError.parsingFailed("Couldn't open Anki database.")
-        }
+        let db = try openDatabase(at: databaseURL)
         defer { sqlite3_close(db) }
+
+        let tables = try Set(tableNames(db: db))
+        if tables.isEmpty {
+            let size = (try? FileManager.default.attributesOfItem(atPath: databaseURL.path)[.size] as? NSNumber)?.intValue ?? -1
+            throw DeckImportError.parsingFailed(
+                "Anki database is empty (no tables, \(size) bytes at \(databaseURL.lastPathComponent)). Usually a truncated ZIP/zstd extract of collection.anki21b — try re-exporting the .apkg from Anki (media optional)."
+            )
+        }
 
         // Modern AnKing packages store notetypes in dedicated tables.
         // Prefer that over legacy `col.models`, which may be a stub.
         let noteTypes: [Int64: NoteType]
-        if tableExists(db: db, name: "notetypes") {
+        if tables.contains("notetypes") {
             noteTypes = try loadNoteTypesFromTable(db: db)
-        } else if tableExists(db: db, name: "col") {
-            // Legacy schema — or modern DB where notetypes detection failed previously.
+        } else if tables.contains("col") {
             do {
                 noteTypes = try loadNoteTypesFromColModels(db: db)
             } catch {
                 throw DeckImportError.parsingFailed(
-                    "Couldn't read Anki note types. This package may be an older stub collection — use a full AnKing .apkg export (collection.anki21b)."
+                    "Couldn't read Anki note types from col.models. Use a full AnKing .apkg (not a tiny stub export). Tables: \(tables.sorted().joined(separator: ", "))."
                 )
             }
         } else {
-            throw DeckImportError.parsingFailed("Anki database has no notetypes or col.models.")
+            throw DeckImportError.parsingFailed(
+                "Anki database missing notetypes/col. Tables found: \(tables.sorted().joined(separator: ", "))."
+            )
         }
 
         let decks: [Int64: DeckInfo]
-        if tableExists(db: db, name: "decks") {
+        if tables.contains("decks") {
             decks = try loadDecksFromTable(db: db)
         } else {
             decks = try loadDecksFromCol(db: db)
@@ -108,6 +113,8 @@ struct AnkiCollectionReader: Sendable {
     }
 
     private static func loadNoteTypesFromTable(db: OpaquePointer) throws -> [Int64: NoteType] {
+        let fieldsByNoteType = loadAllFieldNames(db: db)
+
         var result: [Int64: NoteType] = [:]
         let sql = "SELECT id, name, config FROM notetypes"
         var statement: OpaquePointer?
@@ -132,7 +139,13 @@ struct AnkiCollectionReader: Sendable {
                 type = 1
             }
 
-            let fieldNames = try loadFieldNames(db: db, noteTypeID: id)
+            var fieldNames = fieldsByNoteType[id] ?? []
+            // If the fields table was empty/unreadable, fall back to AnKing ordinal names
+            // so we don't mark every note as "empty".
+            if fieldNames.isEmpty {
+                fieldNames = defaultFieldNames(forNoteTypeNamed: name, cloze: type == 1)
+            }
+
             result[id] = NoteType(id: id, name: name, type: type, fieldNames: fieldNames)
         }
 
@@ -142,20 +155,52 @@ struct AnkiCollectionReader: Sendable {
         return result
     }
 
-    private static func loadFieldNames(db: OpaquePointer, noteTypeID: Int64) throws -> [String] {
-        guard tableExists(db: db, name: "fields") else { return [] }
-        var names: [(Int, String)] = []
-        let sql = "SELECT ord, name FROM fields WHERE ntid = ?"
+    /// Load every field definition in one scan — avoids per-row `sqlite3_bind_*` pitfalls.
+    private static func loadAllFieldNames(db: OpaquePointer) -> [Int64: [String]] {
+        guard tableExists(db: db, name: "fields") else { return [:] }
+
+        var grouped: [Int64: [(Int, String)]] = [:]
+        let sql = "SELECT ntid, ord, name FROM fields"
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
-        defer { sqlite3_finalize(statement) }
-        sqlite3_bind_int64(statement, 1, noteTypeID)
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let ord = Int(sqlite3_column_int(statement, 0))
-            let name = columnText(statement, 1) ?? "Field\(ord)"
-            names.append((ord, name))
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            return [:]
         }
-        return names.sorted { $0.0 < $1.0 }.map(\.1)
+        defer { sqlite3_finalize(statement) }
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let ntid = sqlite3_column_int64(statement, 0)
+            let ord = Int(sqlite3_column_int(statement, 1))
+            let name = columnText(statement, 2) ?? "Field\(ord)"
+            grouped[ntid, default: []].append((ord, name))
+        }
+
+        var result: [Int64: [String]] = [:]
+        for (ntid, pairs) in grouped {
+            result[ntid] = pairs.sorted { $0.0 < $1.0 }.map(\.1)
+        }
+        return result
+    }
+
+    /// AnKing / standard cloze ordinal fallback when `fields` metadata is missing.
+    private static func defaultFieldNames(forNoteTypeNamed name: String, cloze: Bool) -> [String] {
+        let lowered = name.lowercased()
+        if lowered.contains("anking") || cloze {
+            // Typical AnKingOverhaul order (extras after Text may vary; Text is always first).
+            return [
+                "Text",
+                "Extra",
+                "Personal Notes",
+                "Missed Questions",
+                "Lecture Notes",
+                "Boards and Beyond",
+                "First Aid",
+                "Sketchy",
+                "Pixorize",
+                "Physeo",
+                "One by one"
+            ]
+        }
+        return ["Front", "Back"]
     }
 
     private static func parseModel(_ model: [String: Any]) -> NoteType? {
@@ -226,25 +271,116 @@ struct AnkiCollectionReader: Sendable {
             let id = sqlite3_column_int64(statement, 0)
             let mid = sqlite3_column_int64(statement, 1)
             let tagsRaw = columnText(statement, 2) ?? ""
-            let fieldsRaw = columnText(statement, 3) ?? ""
+            // Prefer text; fall back to blob (some builds store flds oddly).
+            let fieldsRaw = columnText(statement, 3)
+                ?? columnBlob(statement, 3).flatMap { String(data: $0, encoding: .utf8) }
+                ?? ""
 
             let tags = tagsRaw
                 .split(separator: " ")
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
 
-            let fields = fieldsRaw.components(separatedBy: "\u{1f}")
+            let fields = splitAnkiFields(fieldsRaw)
             notes.append(RawNote(id: id, modelID: mid, tags: tags, fields: fields))
         }
         return notes
     }
 
+    /// Anki joins fields with U+001F. Tolerate stray NULs from odd exports.
+    private static func splitAnkiFields(_ raw: String) -> [String] {
+        if raw.contains("\u{1f}") {
+            return raw.components(separatedBy: "\u{1f}")
+        }
+        if raw.contains("\0") {
+            return raw.components(separatedBy: "\0")
+        }
+        return [raw]
+    }
+
     // MARK: - SQLite helpers
+
+    /// Anki collections are often WAL-mode. After zstd extract there is no `-wal` / `-shm`
+    /// sidecar, so a normal open fails with "unable to open database file" and looks empty.
+    private static func openDatabase(at url: URL) throws -> OpaquePointer {
+        if let db = tryOpenImmutable(at: url) {
+            return db
+        }
+
+        // Last resort: rewrite journal mode on the temp copy, then reopen immutable.
+        var rw: OpaquePointer?
+        if sqlite3_open_v2(url.path, &rw, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, let handle = rw {
+            registerAnkiCollations(handle)
+            _ = sqlite3_exec(handle, "PRAGMA journal_mode=DELETE;", nil, nil, nil)
+            _ = sqlite3_exec(handle, "PRAGMA wal_checkpoint(TRUNCATE);", nil, nil, nil)
+            sqlite3_close(handle)
+            try? FileManager.default.removeItem(atPath: url.path + "-wal")
+            try? FileManager.default.removeItem(atPath: url.path + "-shm")
+            if let db = tryOpenImmutable(at: url) {
+                return db
+            }
+        } else if let handle = rw {
+            sqlite3_close(handle)
+        }
+
+        throw DeckImportError.parsingFailed(
+            "Couldn't open Anki database (missing WAL sidecars or corrupt file)."
+        )
+    }
+
+    private static func tryOpenImmutable(at url: URL) -> OpaquePointer? {
+        var components = URLComponents()
+        components.scheme = "file"
+        components.path = url.path
+        components.queryItems = [
+            URLQueryItem(name: "mode", value: "ro"),
+            URLQueryItem(name: "immutable", value: "1")
+        ]
+        guard let uri = components.string else { return nil }
+
+        var db: OpaquePointer?
+        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_URI
+        guard sqlite3_open_v2(uri, &db, flags, nil) == SQLITE_OK, let handle = db else {
+            if let db { sqlite3_close(db) }
+            return nil
+        }
+        registerAnkiCollations(handle)
+        return handle
+    }
+
+    /// Anki indexes use a custom `unicase` collation. Without it, queries fail with
+    /// "no such collation sequence: unicase" / "no query solution".
+    private static func registerAnkiCollations(_ db: OpaquePointer) {
+        sqlite3_create_collation_v2(
+            db,
+            "unicase",
+            SQLITE_UTF8,
+            nil,
+            { _, length1, bytes1, length2, bytes2 in
+                let left = String(
+                    bytes: UnsafeRawBufferPointer(start: bytes1, count: Int(length1)),
+                    encoding: .utf8
+                ) ?? ""
+                let right = String(
+                    bytes: UnsafeRawBufferPointer(start: bytes2, count: Int(length2)),
+                    encoding: .utf8
+                ) ?? ""
+                let ordering = left.compare(right, options: [.caseInsensitive, .diacriticInsensitive])
+                switch ordering {
+                case .orderedAscending: return -1
+                case .orderedDescending: return 1
+                case .orderedSame: return 0
+                }
+            },
+            nil
+        )
+    }
 
     private static func scalarText(db: OpaquePointer, sql: String) throws -> String {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            throw DeckImportError.parsingFailed("SQL prepare failed.")
+            let message = String(cString: sqlite3_errmsg(db))
+            throw DeckImportError.parsingFailed("SQL prepare failed: \(message)")
         }
         defer { sqlite3_finalize(statement) }
         guard sqlite3_step(statement) == SQLITE_ROW else {
@@ -253,19 +389,30 @@ struct AnkiCollectionReader: Sendable {
         return columnText(statement, 0) ?? ""
     }
 
-    private static let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    private static func tableNames(db: OpaquePointer) throws -> [String] {
+        let sql = "SELECT name FROM sqlite_master WHERE type='table'"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            let message = String(cString: sqlite3_errmsg(db))
+            throw DeckImportError.parsingFailed("Couldn't list Anki tables: \(message)")
+        }
+        defer { sqlite3_finalize(statement) }
+        var names: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let name = columnText(statement, 0) {
+                names.append(name)
+            }
+        }
+        return names
+    }
 
     private static func tableExists(db: OpaquePointer, name: String) -> Bool {
-        let sql = "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1"
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
-        defer { sqlite3_finalize(statement) }
-        // SQLITE_TRANSIENT copies the string — SQLITE_STATIC (nil) was a dangling-pointer bug
-        // that made `notetypes` look missing, so AnKing imports fell through to stub `col.models`.
-        name.withCString { cString in
-            _ = sqlite3_bind_text(statement, 1, cString, -1, sqliteTransient)
-        }
-        return sqlite3_step(statement) == SQLITE_ROW
+        // Avoid sqlite3_bind_text lifetime pitfalls — only allow known identifiers.
+        let allowed: Set<String> = [
+            "notetypes", "fields", "decks", "notes", "col", "cards", "templates", "config", "tags"
+        ]
+        guard allowed.contains(name) else { return false }
+        return (try? tableNames(db: db))?.contains(name) == true
     }
 
     private static func columnText(_ statement: OpaquePointer?, _ index: Int32) -> String? {

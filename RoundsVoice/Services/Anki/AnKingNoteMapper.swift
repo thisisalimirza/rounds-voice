@@ -17,10 +17,6 @@ enum AnKingNoteMapper {
         var skippedEmpty: Int
         var skippedUnsupportedType: Int
         var noteTypeCounts: [String: Int]
-
-        var skippedTotal: Int {
-            skippedImageOcclusion + skippedEmpty + skippedUnsupportedType
-        }
     }
 
     static func map(collection: AnkiCollectionReader.Collection) -> MappingResult {
@@ -32,7 +28,13 @@ enum AnKingNoteMapper {
 
         for raw in collection.notes {
             guard let noteType = collection.noteTypes[raw.modelID] else {
-                skippedUnsupported += 1
+                // Unknown model — still try ordinal Text/Front if the note has content.
+                if let recovered = recoverOrphanNote(raw) {
+                    imported.append(recovered)
+                    typeCounts["Unknown", default: 0] += 1
+                } else {
+                    skippedUnsupported += 1
+                }
                 continue
             }
 
@@ -44,8 +46,10 @@ enum AnKingNoteMapper {
             }
 
             let fieldMap = dictionary(fields: raw.fields, names: noteType.fieldNames)
-            let kind = classify(noteType: noteType, fields: fieldMap)
-            let oneByOne = isOneByOneEnabled(fieldMap["One by one"] ?? "")
+            let kind = classify(noteType: noteType, fields: fieldMap, rawFields: raw.fields)
+            let oneByOne = isOneByOneEnabled(
+                fieldMap["One by one"] ?? fieldMap["One by One"] ?? ""
+            )
 
             switch kind {
             case .skipUnsupported:
@@ -70,6 +74,10 @@ enum AnKingNoteMapper {
                             )
                         )
                     }
+                    continue
+                }
+                guard !cleanedText.isEmpty else {
+                    skippedEmpty += 1
                     continue
                 }
                 imported.append(
@@ -121,7 +129,8 @@ enum AnKingNoteMapper {
 
     private static func classify(
         noteType: AnkiCollectionReader.NoteType,
-        fields: [String: String]
+        fields: [String: String],
+        rawFields: [String]
     ) -> Kind {
         let name = noteType.name.lowercased()
 
@@ -131,9 +140,9 @@ enum AnKingNoteMapper {
             || name == "cloze"
             || name.contains("cloze")
         {
-            let text = firstValue(in: fields, keys: ["Text", "Front", "Question"])
+            let text = primaryClozeText(fields: fields, rawFields: rawFields)
             let extra = firstValue(in: fields, keys: [
-                "Extra", "Back Extra", "Back", "Answer", "Personal Notes"
+                "Extra", "Back Extra", "Back", "Answer", "Personal Notes", "Field1"
             ])
             if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return .skipEmpty
@@ -145,21 +154,69 @@ enum AnKingNoteMapper {
         }
 
         // Basic / reverse / custom front-back
-        if let front = optionalValue(in: fields, keys: ["Front", "Question"]),
-           let back = optionalValue(in: fields, keys: ["Back", "Answer"])
+        if let front = optionalValue(in: fields, keys: ["Front", "Question", "Text", "Field0"]),
+           let back = optionalValue(in: fields, keys: ["Back", "Answer", "Extra", "Field1"])
         {
             return .basic(front: front, back: back)
         }
 
-        // Fallback: first two fields
-        let values = noteType.fieldNames.compactMap { fields[$0] }
-        if values.count >= 2 {
-            return .basic(front: values[0], back: values[1])
+        // Fallback: first two non-empty raw fields
+        let nonempty = rawFields
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if nonempty.count >= 2 {
+            return .basic(front: nonempty[0], back: nonempty[1])
         }
-        if let only = values.first, !only.isEmpty {
+        if let only = nonempty.first {
             return .basic(front: only, back: "")
         }
         return .skipUnsupported
+    }
+
+    /// Resolve the speakable cloze body even when field metadata is missing/misaligned.
+    private static func primaryClozeText(fields: [String: String], rawFields: [String]) -> String {
+        let named = firstValue(in: fields, keys: [
+            "Text", "Front", "Question", "Cloze", "Content", "Field0"
+        ])
+        if !named.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return named
+        }
+
+        // Prefer the first raw field that looks like real card content (often has {{c1::}}).
+        if let clozeField = rawFields.first(where: {
+            ClozeParser.containsCloze($0)
+                || AnkiHTMLCleaner.plainText(from: $0).count > 8
+        }) {
+            return clozeField
+        }
+        return rawFields.first ?? ""
+    }
+
+    private static func recoverOrphanNote(_ raw: AnkiCollectionReader.RawNote) -> ImportedNote? {
+        guard let body = raw.fields.first(where: {
+            !AnkiHTMLCleaner.plainText(from: $0).isEmpty
+        }) else { return nil }
+
+        let cleaned = AnkiHTMLCleaner.preserveClozePlainText(from: body)
+        guard !cleaned.isEmpty else { return nil }
+        let extra = raw.fields.dropFirst().first.map { AnkiHTMLCleaner.plainText(from: $0) } ?? ""
+
+        if ClozeParser.containsCloze(cleaned) {
+            return ImportedNote(
+                front: cleaned,
+                back: extra,
+                tags: raw.tags,
+                cardType: .cloze,
+                ankiNoteId: String(raw.id)
+            )
+        }
+        return ImportedNote(
+            front: AnkiHTMLCleaner.plainText(from: body),
+            back: extra,
+            tags: raw.tags,
+            cardType: .basic,
+            ankiNoteId: String(raw.id)
+        )
     }
 
     static func isImageOcclusion(noteType: AnkiCollectionReader.NoteType) -> Bool {
@@ -170,11 +227,8 @@ enum AnKingNoteMapper {
             || name.hasPrefix("io-")
             || name == "io"
             || name.contains("imageocclusion")
+            || name.contains("io-one by one")
         {
-            return true
-        }
-        // AnKing IO note types are named like "IO-one by one (AnKing Step Deck / …)"
-        if name.hasPrefix("io-") || name.contains("io-one by one") {
             return true
         }
         let fields = Set(noteType.fieldNames.map { $0.lowercased() })
@@ -195,25 +249,51 @@ enum AnKingNoteMapper {
 
     private static func dictionary(fields: [String], names: [String]) -> [String: String] {
         var map: [String: String] = [:]
-        for (index, name) in names.enumerated() {
+        let resolvedNames: [String]
+        if names.isEmpty {
+            // Same ordinal fallback as the collection reader.
+            resolvedNames = [
+                "Text", "Extra", "Personal Notes", "Missed Questions",
+                "Lecture Notes", "Boards and Beyond", "First Aid",
+                "Sketchy", "Pixorize", "Physeo", "One by one"
+            ]
+        } else {
+            resolvedNames = names
+        }
+
+        for (index, name) in resolvedNames.enumerated() {
             map[name] = index < fields.count ? fields[index] : ""
         }
-        // Also expose by ordinal if names shorter than fields
-        if fields.count > names.count {
-            for i in names.count..<fields.count {
+        if fields.count > resolvedNames.count {
+            for i in resolvedNames.count..<fields.count {
                 map["Field\(i)"] = fields[i]
             }
+        }
+        // Always expose ordinals so classify can recover.
+        for (index, value) in fields.enumerated() {
+            map["Field\(index)"] = value
         }
         return map
     }
 
     private static func firstValue(in fields: [String: String], keys: [String]) -> String {
         for key in keys {
-            if let value = fields[key], !value.isEmpty { return value }
-            // Case-insensitive fallback
+            if let value = fields[key], !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return value
+            }
             if let pair = fields.first(where: { $0.key.lowercased() == key.lowercased() }),
-               !pair.value.isEmpty
+               !pair.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             {
+                return pair.value
+            }
+        }
+        // Fuzzy: "Text (AnKing)" / "Cloze Text" etc.
+        for key in keys {
+            let needle = key.lowercased()
+            if let pair = fields.first(where: {
+                $0.key.lowercased().contains(needle)
+                    && !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }) {
                 return pair.value
             }
         }
@@ -247,7 +327,6 @@ enum AnKingNoteMapper {
 extension AnkiHTMLCleaner {
     /// Strips HTML while preserving Anki cloze `{{cN::...}}` markers.
     static func preserveClozePlainText(from html: String) -> String {
-        // Temporarily protect cloze tokens from tag stripping edge cases
         var text = html
         text = text.replacingOccurrences(of: "<br>", with: " ", options: .caseInsensitive)
         text = text.replacingOccurrences(of: "<br/>", with: " ", options: .caseInsensitive)

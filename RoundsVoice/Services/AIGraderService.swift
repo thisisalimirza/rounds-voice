@@ -144,22 +144,21 @@ struct LLMAnswerGrader: AIGraderService {
 
     private var systemPrompt: String {
         """
-        You are a medical school professor grading a student's spoken Anki answer during a hands-free review.
+        You grade hands-free Anki / AnKing answers for a medical student walking.
 
-        Accept:
-        - Synonyms and equivalent phrasings
-        - Correct mechanisms stated in different order
-        - Standard medical abbreviations (e.g., HTN, MI, AMPK, COX)
-        - Partial articles/filler from speech-to-text noise
+        The card has a fixed expected answer (cloze blank or back). Grade against THAT, not a vague topic.
 
-        Reject:
-        - Vague answers ("it helps diabetes", "it's an antibiotic")
-        - Incorrect mechanisms or wrong drug class
-        - Answers that miss the critical teaching point
+        Speech-to-text is noisy: missing first words, wrong drug spelling, "activates" vs "activist", \
+        "B6" vs "vitamin B6", abbreviations. Accept clear semantic matches and standard synonyms.
 
-        Feedback must be ONE short sentence suitable for text-to-speech.
-        If correct, prefer "Correct." or a brief affirmation.
-        If incorrect, briefly name the key expected idea without lecturing.
+        Mark correct when the student hit the teaching point, even if wording differs.
+        Mark incorrect only when the critical fact is wrong or missing.
+
+        Feedback rules (spoken aloud — keep to one short sentence):
+        - If correct: "Correct." or a brief affirmation. Do NOT restate the whole answer.
+        - If incorrect or incomplete: MUST end with the exact expected answer, e.g. \
+          "Not quite. The answer is pyridoxine (vitamin B6)." \
+          Never say only "incorrect" or "incomplete mechanism" without stating the answer.
 
         Respond with ONLY JSON:
         {"isCorrect":true,"confidence":0.0,"feedback":"...","score":0}
@@ -172,10 +171,15 @@ struct LLMAnswerGrader: AIGraderService {
         expectedAnswer: String,
         userAnswer: String
     ) async throws -> GradeResult {
+        // Fast path: obvious match / STT-near match — don't wait on the network.
+        if let quick = AnswerMatching.quickGrade(expected: expectedAnswer, spoken: userAnswer) {
+            return quick
+        }
+
         let userPrompt = """
-        Question: \(question)
-        Expected answer: \(expectedAnswer)
-        Student answer: \(userAnswer)
+        Question (spoken): \(question)
+        Expected answer (card back / cloze): \(expectedAnswer)
+        Student said (speech-to-text): \(userAnswer)
         """
 
         do {
@@ -183,14 +187,15 @@ struct LLMAnswerGrader: AIGraderService {
                 systemPrompt: systemPrompt,
                 userPrompt: userPrompt
             )
-            return try Self.parseGrade(from: raw)
+            let parsed = try Self.parseGrade(from: raw)
+            return AnswerMatching.ensureAnswerRevealed(parsed, expected: expectedAnswer)
         } catch {
-            // Keep the walking session alive if the network/API fails.
-            return try await fallback.gradeAnswer(
+            let fallbackGrade = try await fallback.gradeAnswer(
                 question: question,
                 expectedAnswer: expectedAnswer,
                 userAnswer: userAnswer
             )
+            return AnswerMatching.ensureAnswerRevealed(fallbackGrade, expected: expectedAnswer)
         }
     }
 
@@ -230,8 +235,12 @@ struct HeuristicAnswerGrader: AIGraderService {
         userAnswer: String
     ) async throws -> GradeResult {
         _ = question
-        let expectedTokens = tokenize(expectedAnswer)
-        let userTokens = tokenize(userAnswer)
+        if let quick = AnswerMatching.quickGrade(expected: expectedAnswer, spoken: userAnswer) {
+            return quick
+        }
+
+        let expectedTokens = AnswerMatching.tokenize(expectedAnswer)
+        let userTokens = AnswerMatching.tokenize(userAnswer)
 
         guard !expectedTokens.isEmpty else {
             return GradeResult(
@@ -244,15 +253,19 @@ struct HeuristicAnswerGrader: AIGraderService {
 
         let overlap = expectedTokens.intersection(userTokens)
         let recall = Double(overlap.count) / Double(expectedTokens.count)
+        // Also credit if the full expected phrase (normalized) appears in what they said.
+        let phraseHit = AnswerMatching.normalized(userAnswer)
+            .contains(AnswerMatching.normalized(expectedAnswer))
+            && AnswerMatching.normalized(expectedAnswer).count >= 3
 
-        let isCorrect = recall >= 0.55
+        let isCorrect = recall >= 0.45 || phraseHit
         let feedback: String
         if isCorrect {
             feedback = "Correct."
-        } else if recall >= 0.3 {
-            feedback = "Partially correct. Expected: \(expectedAnswer)"
+        } else if recall >= 0.25 {
+            feedback = "Partially correct. The answer is \(expectedAnswer)."
         } else {
-            feedback = "Incorrect. Expected: \(expectedAnswer)"
+            feedback = "Incorrect. The answer is \(expectedAnswer)."
         }
 
         return GradeResult(
@@ -262,18 +275,82 @@ struct HeuristicAnswerGrader: AIGraderService {
             score: Int((recall * 100).rounded())
         )
     }
+}
 
-    private func tokenize(_ text: String) -> Set<String> {
+/// Shared matching helpers for noisy medical speech-to-text.
+enum AnswerMatching {
+    static func quickGrade(expected: String, spoken: String) -> GradeResult? {
+        let e = normalized(expected)
+        let s = normalized(spoken)
+        guard !e.isEmpty, !s.isEmpty else { return nil }
+
+        if e == s || s.contains(e) || e.contains(s) {
+            return GradeResult(isCorrect: true, confidence: 0.92, feedback: "Correct.", score: 95)
+        }
+
+        // Token containment for short cloze answers (e.g. expected "ampk", said "activates ampk").
+        let expectedTokens = tokenize(expected)
+        let spokenTokens = tokenize(spoken)
+        if !expectedTokens.isEmpty, expectedTokens.isSubset(of: spokenTokens) {
+            return GradeResult(isCorrect: true, confidence: 0.88, feedback: "Correct.", score: 90)
+        }
+
+        return nil
+    }
+
+    static func ensureAnswerRevealed(_ grade: GradeResult, expected: String) -> GradeResult {
+        let expectedClean = expected
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !grade.isCorrect, !expectedClean.isEmpty else { return grade }
+
+        let feedback = grade.feedback.trimmingCharacters(in: .whitespacesAndNewlines)
+        let alreadyRevealed = feedback.localizedCaseInsensitiveContains(expectedClean)
+            || normalized(feedback).contains(normalized(expectedClean))
+        if alreadyRevealed { return grade }
+
+        let prefix = feedback.isEmpty || feedback.lowercased() == "incorrect."
+            ? "Incorrect."
+            : feedback.trimmingCharacters(in: CharacterSet(charactersIn: ".")) + "."
+        return GradeResult(
+            isCorrect: false,
+            confidence: grade.confidence,
+            feedback: "\(prefix) The answer is \(expectedClean).",
+            score: grade.score
+        )
+    }
+
+    static func normalized(_ text: String) -> String {
+        var t = text.lowercased()
+        let replacements: [(String, String)] = [
+            ("vitamin ", ""),
+            ("vit ", ""),
+            ("approx", ""),
+            ("approximately", ""),
+            ("the ", ""),
+            ("a ", ""),
+            ("an ", "")
+        ]
+        for (a, b) in replacements {
+            t = t.replacingOccurrences(of: a, with: b)
+        }
+        return t
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    static func tokenize(_ text: String) -> Set<String> {
         let stopwords: Set<String> = [
             "a", "an", "the", "of", "and", "or", "to", "in", "on", "for",
-            "with", "by", "is", "are", "it", "that", "this", "through"
+            "with", "by", "is", "are", "it", "that", "this", "through",
+            "um", "uh", "like", "just"
         ]
 
-        let cleaned = text
-            .lowercased()
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { !$0.isEmpty && !stopwords.contains($0) && $0.count > 1 }
-
-        return Set(cleaned)
+        return Set(
+            normalized(text)
+                .split(separator: " ")
+                .map(String.init)
+                .filter { !$0.isEmpty && !stopwords.contains($0) && $0.count > 1 }
+        )
     }
 }

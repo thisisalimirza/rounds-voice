@@ -122,7 +122,7 @@ struct HomeView: View {
             .overlay {
                 if importViewModel.isImporting {
                     ZStack {
-                        Color.black.opacity(0.35).ignoresSafeArea()
+                        Color.black.opacity(0.45).ignoresSafeArea()
                         VStack(spacing: 14) {
                             ProgressView()
                                 .tint(RVTheme.seafoam)
@@ -130,8 +130,14 @@ struct HomeView: View {
                                 .font(RVTheme.Typography.headline)
                                 .foregroundStyle(RVTheme.bone)
                                 .multilineTextAlignment(.center)
+                            Text("Keep Rounds Voice open until this finishes.\nLeaving the app can cancel a large AnKing import.")
+                                .font(RVTheme.Typography.caption)
+                                .foregroundStyle(RVTheme.bone.opacity(0.7))
+                                .multilineTextAlignment(.center)
+                                .padding(.top, 4)
                         }
                         .padding(28)
+                        .frame(maxWidth: 320)
                         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
                     }
                 }

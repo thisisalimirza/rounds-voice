@@ -1,6 +1,7 @@
 import Foundation
 import SwiftData
 import SwiftUI
+import UIKit
 
 @Observable
 @MainActor
@@ -19,10 +20,14 @@ final class ReviewSessionViewModel {
     private(set) var liveTranscript: String = ""
     private(set) var errorMessage: String?
     private(set) var needsPermissions = false
+    private(set) var isSuspended = false
 
     private var sessionTask: Task<Void, Never>?
     private var captionTask: Task<Void, Never>?
     private var answerContinuation: CheckedContinuation<String, Never>?
+    private var resumeContinuation: CheckedContinuation<Void, Never>?
+    private let nowPlaying = NowPlayingSession.shared
+    private let liveActivity = ReviewLiveActivityController.shared
 
     init(
         deck: Deck,
@@ -55,9 +60,11 @@ final class ReviewSessionViewModel {
         errorMessage = nil
         needsPermissions = false
         liveTranscript = ""
+        isSuspended = false
         sessionTask?.cancel()
         captionTask?.cancel()
         finishPendingAnswer(with: "")
+        finishResumeWait()
         sessionTask = Task { await runSession() }
     }
 
@@ -67,8 +74,23 @@ final class ReviewSessionViewModel {
         captionTask?.cancel()
         captionTask = nil
         finishPendingAnswer(with: "")
+        finishResumeWait()
         voice.cancel()
+        voice.endReviewAudio()
+        nowPlaying.deactivate()
+        liveActivity.end()
+        UIApplication.shared.isIdleTimerDisabled = false
         status = .paused
+        isSuspended = false
+    }
+
+    /// Re-assert audio after returning to foreground (lock is fine — this is unlock/active).
+    func reassertAfterBecomingActive() {
+        guard sessionTask != nil else { return }
+        Task {
+            try? await voice.reassertAudioSession()
+            publishSessionChrome()
+        }
     }
 
     /// Manual / typed override — wins the race against live listening.
@@ -78,28 +100,53 @@ final class ReviewSessionViewModel {
     }
 
     func skip() {
+        if isSuspended { resumeSession() }
         submitAnswer(VoiceCommand.skip.rawValue)
     }
 
     func markDontKnow() {
+        if isSuspended { resumeSession() }
         submitAnswer(VoiceCommand.dontKnow.rawValue)
     }
 
     func repeatQuestion() {
+        if isSuspended { resumeSession() }
         submitAnswer(VoiceCommand.repeat.rawValue)
     }
 
     func pauseSession() {
+        guard !isSuspended else { return }
+        isSuspended = true
         voice.pause()
         status = .paused
+        publishSessionChrome()
+    }
+
+    func resumeSession() {
+        guard isSuspended else { return }
+        isSuspended = false
+        voice.resume()
+        publishSessionChrome()
+        finishResumeWait()
     }
 
     private func runSession() async {
+        UIApplication.shared.isIdleTimerDisabled = true
+        nowPlaying.activate()
+        liveActivity.start(deckName: deck.name)
+        nowPlaying.onRemote = { [weak self] action in
+            self?.handleRemote(action)
+        }
+        publishSessionChrome()
+
         do {
-            try voice.configureAudioSession()
+            try await voice.beginReviewAudio()
         } catch {
             errorMessage = error.localizedDescription
             status = .finished
+            nowPlaying.deactivate()
+            liveActivity.end()
+            UIApplication.shared.isIdleTimerDisabled = false
             return
         }
 
@@ -108,21 +155,105 @@ final class ReviewSessionViewModel {
             needsPermissions = true
             errorMessage = "Microphone and speech recognition are required for walking reviews."
             status = .finished
+            voice.endReviewAudio()
+            nowPlaying.deactivate()
+            liveActivity.end()
+            UIApplication.shared.isIdleTimerDisabled = false
             return
         }
 
         while !Task.isCancelled {
+            await waitIfSuspended()
+            guard !Task.isCancelled else { break }
+
             guard let card = queue.first else {
                 status = .finished
+                publishSessionChrome()
                 try? await voice.speak("Session complete. Great work.")
-                return
+                break
             }
 
             currentCard = card
+            publishSessionChrome()
             let shouldAdvance = await present(card: card)
             if shouldAdvance {
                 queue.removeAll { $0.id == card.id }
             }
+        }
+
+        voice.endReviewAudio()
+        nowPlaying.deactivate()
+        liveActivity.end()
+        UIApplication.shared.isIdleTimerDisabled = false
+    }
+
+    private func waitIfSuspended() async {
+        guard isSuspended else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            finishResumeWait()
+            resumeContinuation = continuation
+        }
+    }
+
+    private func finishResumeWait() {
+        if let resumeContinuation {
+            self.resumeContinuation = nil
+            resumeContinuation.resume()
+        }
+    }
+
+    private func handleRemote(_ action: NowPlayingSession.RemoteAction) {
+        switch action {
+        case .pause:
+            if isSuspended {
+                resumeSession()
+            } else {
+                pauseSession()
+            }
+        case .resume:
+            resumeSession()
+        case .skip:
+            skip()
+        case .repeat:
+            repeatQuestion()
+        }
+    }
+
+    private func publishSessionChrome() {
+        let detail = sessionDetailText()
+        nowPlaying.update(
+            deckName: deck.name,
+            detail: detail,
+            isPlaying: !isSuspended && status != .finished && status != .paused
+        )
+        liveActivity.update(
+            phase: status.activityPhase,
+            detail: detail,
+            cardsCompleted: stats.cardsCompleted,
+            correctCount: stats.correctCount,
+            queueRemaining: queue.count,
+            isPaused: isSuspended || status == .paused
+        )
+    }
+
+    private func sessionDetailText() -> String {
+        switch status {
+        case .speaking:
+            return currentCard.map { String($0.displayQuestion.prefix(60)) } ?? "Speaking…"
+        case .listening:
+            return liveTranscript.isEmpty ? "Speak now…" : liveTranscript
+        case .thinking:
+            return "Thinking…"
+        case .correct:
+            return "Correct"
+        case .incorrect:
+            return lastFeedback.isEmpty ? "Incorrect" : lastFeedback
+        case .paused:
+            return "Paused — tap play on AirPods to continue"
+        case .finished:
+            return "Session complete"
+        case .idle:
+            return "Ready"
         }
     }
 
@@ -130,24 +261,41 @@ final class ReviewSessionViewModel {
     @discardableResult
     private func present(card: Card) async -> Bool {
         do {
+            await waitIfSuspended()
+            guard !Task.isCancelled else { return false }
+
+            if voice.consumePromptReplayRequest() {
+                try? await voice.speak("Audio glitch. Repeating the question.")
+            }
+
             liveTranscript = ""
             status = .speaking
+            publishSessionChrome()
             prefetchNextPrompt(after: card)
             try await voice.speak(card.spokenQuestion)
             guard !Task.isCancelled else { return false }
 
-            status = .listening
-            startCaptionPolling()
+            if voice.consumePromptReplayRequest() {
+                return await present(card: card)
+            }
+
+            await waitIfSuspended()
+            guard !Task.isCancelled else { return false }
+
             prefetchNextPrompt(after: card)
+            voice.prepareAnswerContext(
+                question: card.spokenQuestion,
+                expectedAnswer: card.spokenAnswer
+            )
 
             let transcript = await collectAnswer()
             stopCaptionPolling()
             lastTranscript = transcript
             liveTranscript = transcript
+            publishSessionChrome()
 
             guard !Task.isCancelled else { return false }
             guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                // No speech and no manual input — ask again.
                 try? await voice.speak("I didn't catch that. Let's try again.")
                 return await present(card: card)
             }
@@ -157,6 +305,7 @@ final class ReviewSessionViewModel {
             }
 
             status = .thinking
+            publishSessionChrome()
             let grade = try await grader.gradeAnswer(
                 question: card.spokenQuestion,
                 expectedAnswer: card.spokenAnswer,
@@ -166,10 +315,12 @@ final class ReviewSessionViewModel {
             return true
         } catch is CancellationError {
             status = .paused
+            publishSessionChrome()
             return false
         } catch {
             errorMessage = error.localizedDescription
             status = .idle
+            publishSessionChrome()
             return false
         }
     }
@@ -179,7 +330,11 @@ final class ReviewSessionViewModel {
         await withTaskGroup(of: String.self) { group in
             group.addTask { @MainActor in
                 do {
-                    return try await self.voice.listenForAnswer(maxDuration: 28)
+                    try await self.voice.startListening()
+                    self.status = .listening
+                    self.publishSessionChrome()
+                    self.startCaptionPolling()
+                    return try await self.voice.awaitAnswer(maxDuration: 28)
                 } catch is CancellationError {
                     return ""
                 } catch {
@@ -202,7 +357,6 @@ final class ReviewSessionViewModel {
                 let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty {
                     chosen = trimmed
-                    // Resume the other waiter before cancelling the group.
                     self.finishPendingAnswer(with: "")
                     _ = await self.voice.stopListening()
                     group.cancelAll()
@@ -238,8 +392,15 @@ final class ReviewSessionViewModel {
                 let partial = self.voice.partialTranscript
                 if partial != self.liveTranscript {
                     self.liveTranscript = partial
+                    if self.status == .listening {
+                        self.publishSessionChrome()
+                    }
                 }
-                try? await Task.sleep(for: .milliseconds(120))
+                if self.status == .listening, self.voice.state == .processing {
+                    self.status = .thinking
+                    self.publishSessionChrome()
+                }
+                try? await Task.sleep(for: .milliseconds(80))
             }
         }
     }
@@ -262,16 +423,15 @@ final class ReviewSessionViewModel {
             await apply(grade: .unknown, to: card)
             return true
         case .pause:
-            voice.pause()
-            status = .paused
+            pauseSession()
+            await waitIfSuspended()
             return false
         case .explain:
             let explanation = "The expected answer is \(card.spokenAnswer)."
             lastFeedback = explanation
             status = .speaking
+            publishSessionChrome()
             try? await voice.speak(explanation)
-            status = .listening
-            startCaptionPolling()
             let transcript = await collectAnswer()
             stopCaptionPolling()
             lastTranscript = transcript
@@ -280,6 +440,7 @@ final class ReviewSessionViewModel {
                 return await handle(command: nested, card: card)
             }
             status = .thinking
+            publishSessionChrome()
             do {
                 let grade = try await grader.gradeAnswer(
                     question: card.spokenQuestion,
@@ -293,27 +454,28 @@ final class ReviewSessionViewModel {
                 return false
             }
         case .resume:
-            voice.resume()
-            status = .listening
+            resumeSession()
             return false
         }
     }
 
     private func apply(grade: GradeResult, to card: Card) async {
-        let rating = ReviewRating(from: grade)
+        let expected = card.spokenAnswer
+        let revealed = AnswerMatching.ensureAnswerRevealed(grade, expected: expected)
+        let rating = ReviewRating(from: revealed)
         scheduler.recordReview(card: card, rating: rating)
         deck.lastReviewedAt = .now
-        stats.record(grade: grade)
-        lastFeedback = grade.feedback
-        status = grade.isCorrect ? .correct : .incorrect
+        stats.record(grade: revealed)
+        lastFeedback = revealed.feedback
+        status = revealed.isCorrect ? .correct : .incorrect
+        publishSessionChrome()
 
-        let spoken = grade.feedback.isEmpty
-            ? (grade.isCorrect ? "Correct." : "Incorrect.")
-            : grade.feedback
-        // Warm the next card while feedback speaks / short pause.
+        let spoken = revealed.feedback.isEmpty
+            ? (revealed.isCorrect ? "Correct." : "Incorrect. The answer is \(expected).")
+            : revealed.feedback
         prefetchNextPrompt(after: card)
         try? await voice.speak(spoken)
-        try? await Task.sleep(for: .milliseconds(450))
+        try? await Task.sleep(for: .milliseconds(revealed.isCorrect ? 350 : 700))
     }
 
     private func prefetchNextPrompt(after card: Card) {
@@ -321,5 +483,9 @@ final class ReviewSessionViewModel {
               index + 1 < queue.count
         else { return }
         voice.prefetchSpeech(queue[index + 1].spokenQuestion)
+        // Prefetch one more when possible for locked walks with flaky network.
+        if index + 2 < queue.count {
+            voice.prefetchSpeech(queue[index + 2].spokenQuestion)
+        }
     }
 }

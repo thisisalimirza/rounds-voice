@@ -1,6 +1,9 @@
 import AVFoundation
 import Foundation
 import Speech
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// States exposed to the review UI for the voice pipeline.
 enum VoiceEngineState: Equatable, Sendable {
@@ -38,13 +41,28 @@ protocol VoiceManaging: AnyObject {
     var state: VoiceEngineState { get }
     var lastTranscript: String { get }
     var partialTranscript: String { get }
+    /// Set after an audio interruption mid-prompt — ViewModel should re-speak the card.
+    var promptReplayRequested: Bool { get }
 
-    func configureAudioSession() throws
+    /// Card-specific vocabulary for OpenAI STT + Apple contextual strings.
+    func prepareAnswerContext(question: String, expectedAnswer: String)
+
+    /// Start continuous audio (keep-alive) for a locked-screen walk session.
+    func beginReviewAudio() async throws
+    func endReviewAudio()
+    func reassertAudioSession() async throws
+    func consumePromptReplayRequest() -> Bool
+
+    func configureAudioSession() async throws
     func requestPermissions() async -> Bool
     func speak(_ text: String) async throws
     func prefetchSpeech(_ text: String)
+    /// Convenience: arm mic, then wait for an utterance.
     func listenForAnswer(maxDuration: TimeInterval) async throws -> String
+    /// Start the mic / recognizer. Only returns once capture is actually running.
     func startListening() async throws
+    /// Wait until silence (or timeout) after `startListening()`.
+    func awaitAnswer(maxDuration: TimeInterval) async throws -> String
     func stopListening() async -> String
     func cancel()
     func pause()
@@ -56,12 +74,16 @@ final class VoiceManager: NSObject, VoiceManaging {
     private(set) var state: VoiceEngineState = .idle
     private(set) var lastTranscript: String = ""
     private(set) var partialTranscript: String = ""
+    private(set) var promptReplayRequested = false
 
-    var silenceTimeout: TimeInterval = 1.55
-    var commandSilenceTimeout: TimeInterval = 0.45
-    var minimumSpeechDuration: TimeInterval = 0.35
-    /// RMS peak above this counts as speech for energy VAD (OpenAI path).
-    var speechEnergyThreshold: Float = 0.025
+    /// End-of-answer silence before we finalize (snappy turn-taking).
+    var silenceTimeout: TimeInterval = 0.75
+    var commandSilenceTimeout: TimeInterval = 0.28
+    var minimumSpeechDuration: TimeInterval = 0.15
+    /// How long the caption must stay unchanged before we treat the utterance as done.
+    var transcriptStableTimeout: TimeInterval = 0.70
+    /// Peak above this counts as real speech energy (above AirPods hiss / room noise).
+    var speechEnergyThreshold: Float = 0.028
 
     private let synthesizer = AVSpeechSynthesizer()
     private var audioPlayer: AVAudioPlayer?
@@ -69,15 +91,21 @@ final class VoiceManager: NSObject, VoiceManaging {
     private var speechContinuation: CheckedContinuation<Void, Error>?
     private var speakGeneration = 0
     private var settings: AppSettings
+    private let audio = ContinuousAudioSession.shared
 
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
-    private let audioEngine = AVAudioEngine()
-    private let captureBuffer = PCM24kCaptureBuffer()
+    private var micTapInstalled = false
+    private let captureBuffer = AnswerAudioCapture()
     private var realtimeClient: RealtimeTranscriptionClient?
     private var pcmStreamOffset = 0
     private var usingOpenAISTT = false
+    /// Bias STT toward this card's medical terms (set before listen).
+    private var sttQuestionHint = ""
+    private var sttExpectedAnswerHint = ""
+    private var sttVocabularyHints: [String] = []
+    private var wasSpeakingAtInterruption = false
 
     private var silenceTask: Task<Void, Never>?
     private var prefetchTask: Task<Void, Never>?
@@ -85,6 +113,8 @@ final class VoiceManager: NSObject, VoiceManaging {
     private var listenContinuation: CheckedContinuation<String, Error>?
     private var lastSpeechDate: Date?
     private var firstSpeechDate: Date?
+    /// Last time the caption text actually changed (not a duplicate Apple partial).
+    private var lastTranscriptChangeDate: Date?
     private var listenStartedAt: Date?
     private var hasReceivedSpeech = false
     private var playbackWatchdog: Task<Void, Never>?
@@ -112,30 +142,67 @@ final class VoiceManager: NSObject, VoiceManaging {
 
     // MARK: - Session
 
-    func configureAudioSession() throws {
-        let session = AVAudioSession.sharedInstance()
-        // Tear down any prior activation so AirPods / dual-engine handoffs don't hit !ses (expired session).
-        try? session.setActive(false, options: .notifyOthersOnDeactivation)
-        try session.setCategory(
-            .playAndRecord,
-            mode: .spokenAudio,
-            options: [
-                .defaultToSpeaker,
-                .allowBluetooth,
-                .allowBluetoothA2DP,
-                .duckOthers
-            ]
-        )
-        try session.setActive(true, options: .notifyOthersOnDeactivation)
-        try? session.overrideOutputAudioPort(.speaker)
+    func prepareAnswerContext(question: String, expectedAnswer: String) {
+        sttQuestionHint = question
+        sttExpectedAnswerHint = expectedAnswer
+        sttVocabularyHints = Self.vocabularyHints(from: expectedAnswer + " " + question)
     }
 
-    /// Stop TTS playback engines and refresh the session before microphone use.
-    private func prepareForListening() throws {
+    func beginReviewAudio() async throws {
+        try await audio.beginReview()
+    }
+
+    func endReviewAudio() {
+        removeMicTap()
+        audio.endReview()
+    }
+
+    func reassertAudioSession() async throws {
+        try await audio.reassert()
+    }
+
+    func consumePromptReplayRequest() -> Bool {
+        let value = promptReplayRequested
+        promptReplayRequested = false
+        return value
+    }
+
+    /// Configures play-and-record via the continuous session (no deactivate between turns).
+    func configureAudioSession(bounce: Bool = false) async throws {
+        try await audio.configureSession(bounce: bounce)
+        if audio.isReviewActive {
+            try audio.ensureEngineRunning()
+            audio.startKeepAlive()
+        }
+    }
+
+    func configureAudioSession() async throws {
+        try await configureAudioSession(bounce: false)
+    }
+
+    private static func vocabularyHints(from text: String) -> [String] {
+        let cleaned = text
+            .replacingOccurrences(of: #"[\[\]\(\)\{\}]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"[^\w\s\-/]"#, with: " ", options: .regularExpression)
+        let parts = cleaned.split(whereSeparator: { $0.isWhitespace || $0 == "/" || $0 == "-" })
+        var seen = Set<String>()
+        var out: [String] = []
+        for part in parts {
+            let token = String(part)
+            guard token.count >= 3 else { continue }
+            let key = token.lowercased()
+            guard seen.insert(key).inserted else { continue }
+            out.append(token)
+            if out.count >= 40 { break }
+        }
+        return out
+    }
+
+    /// Soft handoff to mic — keep shared engine alive.
+    private func prepareForListening() async throws {
         stopCurrentSpeech(resumeContinuation: false)
-        // Give hardware a beat after PCM engine teardown (especially with AirPods).
-        // Caller may await a short sleep after this.
-        try configureAudioSession()
+        try await configureAudioSession(bounce: false)
+        audio.resumeKeepAliveAfterTTS()
     }
 
     func requestPermissions() async -> Bool {
@@ -145,8 +212,9 @@ final class VoiceManager: NSObject, VoiceManaging {
                 continuation.resume(returning: status == .authorized)
             }
         }
-        // Mic is required; Apple Speech is only needed for offline fallback.
-        return micGranted && (settings.shouldUseOpenAISTT || speechGranted)
+        // Warm the recognizer so the first listen isn't cold-start slow.
+        _ = speechRecognizer?.isAvailable
+        return micGranted && speechGranted
     }
 
     // MARK: - Text to speech
@@ -158,7 +226,7 @@ final class VoiceManager: NSObject, VoiceManaging {
         let generation = speakGeneration
         state = .speaking
 
-        try configureAudioSession()
+        try await configureAudioSession(bounce: false)
 
         if let provider = settings.makeOpenAITTSProvider {
             do {
@@ -174,12 +242,10 @@ final class VoiceManager: NSObject, VoiceManaging {
         }
 
         guard generation == speakGeneration else { throw CancellationError() }
-        // Hand off cleanly to the mic path (prevents OSStatus !ses / expired session with AirPods).
+        // Stop TTS only — do NOT bounce the session here. Bouncing + sleeping after
+        // speak() made the UI say "Listening" while the mic was still cold, which
+        // clipped the first word of nearly every answer.
         stopCurrentSpeech(resumeContinuation: false)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        try await Task.sleep(for: .milliseconds(120))
-        try configureAudioSession()
-        try await Task.sleep(for: .milliseconds(100))
     }
 
     func prefetchSpeech(_ text: String) {
@@ -282,8 +348,8 @@ final class VoiceManager: NSObject, VoiceManaging {
         utterance.voice = preferredEnglishVoice()
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate * 0.95
         utterance.pitchMultiplier = 1.0
-        utterance.preUtteranceDelay = 0.08
-        utterance.postUtteranceDelay = 0.12
+        utterance.preUtteranceDelay = 0.02
+        utterance.postUtteranceDelay = 0.04
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             self.speechContinuation = continuation
@@ -317,7 +383,11 @@ final class VoiceManager: NSObject, VoiceManaging {
 
     func listenForAnswer(maxDuration: TimeInterval = 28) async throws -> String {
         try await startListening()
-        return try await withCheckedThrowingContinuation { continuation in
+        return try await awaitAnswer(maxDuration: maxDuration)
+    }
+
+    func awaitAnswer(maxDuration: TimeInterval = 28) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
             self.listenContinuation = continuation
             self.startSilenceMonitor(maxDuration: maxDuration)
         }
@@ -330,120 +400,147 @@ final class VoiceManager: NSObject, VoiceManaging {
         partialTranscript = ""
         lastSpeechDate = nil
         firstSpeechDate = nil
+        lastTranscriptChangeDate = nil
         hasReceivedSpeech = false
         listenStartedAt = .now
         pcmStreamOffset = 0
         captureBuffer.reset()
         usingOpenAISTT = settings.shouldUseOpenAISTT
-        state = .listening
+        // Stay idle until the mic is actually running.
+        state = .idle
 
-        try prepareForListening()
-        try await Task.sleep(for: .milliseconds(60))
+        try await prepareForListening()
 
         if usingOpenAISTT {
             await startOpenAIListening()
         } else {
-            try startAppleListening()
+            try await startAppleListening()
         }
+
+        guard audio.isEngineRunning || micTapInstalled else {
+            throw VoiceError.audioEngineFailed("Microphone failed to start.")
+        }
+
+        state = .listening
+        signalMicReady()
+    }
+
+    private func signalMicReady() {
+        audio.playMicReadyEarcon()
+        #if canImport(UIKit)
+        let generator = UIImpactFeedbackGenerator(style: .light)
+        generator.prepare()
+        generator.impactOccurred(intensity: 0.55)
+        #endif
+    }
+
+    private var preferOnDeviceRecognition: Bool {
+        #if canImport(UIKit)
+        return UIApplication.shared.applicationState != .active
+        #else
+        return false
+        #endif
     }
 
     private func startOpenAIListening() async {
-        // Live captions via realtime; final answer via gpt-4o-transcribe on captured WAV.
-        let client = RealtimeTranscriptionClient()
-        realtimeClient = client
-        client.onPartial = { [weak self] text in
-            guard let self else { return }
-            self.partialTranscript = text
-            self.lastTranscript = text
-            self.markSpeechActivity()
-        }
-        client.onSpeechActivity = { [weak self] in
-            self?.markSpeechActivity()
-        }
-
-        if let provider = settings.makeOpenAISTTProvider {
-            try? await client.connect(apiKey: provider.apiKey, projectID: provider.projectID)
-        }
-
-        // Always keep Apple as live caption backup if realtime isn't up.
-        if !client.isConnected {
-            try? startAppleListening(alongsideCapture: true)
-        } else {
-            installCaptureTap(feedApple: false)
-        }
-
-        startPCMPump()
+        // Apple live captions + WAV capture for gpt-4o-transcribe.
+        try? await startAppleListening(alongsideCapture: true)
     }
 
-    private func startAppleListening(alongsideCapture: Bool = false) throws {
+    private func startAppleListening(alongsideCapture: Bool = false) async throws {
         guard let recognizer = speechRecognizer, recognizer.isAvailable else {
             if !alongsideCapture && !usingOpenAISTT {
                 state = .error("Recognizer unavailable")
                 throw VoiceError.recognizerUnavailable
             }
-            if !alongsideCapture {
-                installCaptureTap(feedApple: false)
+            if recognitionRequest == nil {
+                await installCaptureTap(feedApple: false)
             }
+            return
+        }
+
+        // Avoid double-installing the tap if OpenAI path already started Apple.
+        if recognitionTask != nil, alongsideCapture {
             return
         }
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        request.requiresOnDeviceRecognition = false
-        request.contextualStrings = [
+        // Locked / background: prefer on-device so we don't depend on network STT staying warm.
+        request.requiresOnDeviceRecognition = preferOnDeviceRecognition && recognizer.supportsOnDeviceRecognition
+        request.taskHint = .dictation
+        var context = [
             "metformin", "AMPK", "gluconeogenesis", "vancomycin", "warfarin",
             "atorvastatin", "metoprolol", "lisinopril", "losartan", "spironolactone",
+            "appendicitis", "ultrasound", "MRI", "CT", "pregnancy",
             "repeat", "skip", "pause", "explain", "I don't know"
         ]
+        context.append(contentsOf: sttVocabularyHints)
+        request.contextualStrings = Array(context.prefix(100))
         recognitionRequest = request
 
-        installCaptureTap(feedApple: true)
-
+        // Start the recognition task BEFORE the mic tap so the first buffers
+        // (and the first spoken word) aren't dropped on the floor.
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
             guard let self else { return }
             Task { @MainActor in
                 self.handleAppleRecognition(result: result, error: error)
             }
         }
+
+        await installCaptureTap(feedApple: true)
     }
 
-    private func installCaptureTap(feedApple: Bool) {
-        let inputNode = audioEngine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else { return }
+    private func installCaptureTap(feedApple: Bool) async {
+        try? await configureAudioSession(bounce: false)
+        audio.resumeKeepAliveAfterTTS()
 
-        inputNode.removeTap(onBus: 0)
+        let inputNode = audio.inputNode
+        // Soft reinstall — never reset/stop the shared engine (that kills keep-alive).
+        if micTapInstalled {
+            inputNode.removeTap(onBus: 0)
+            micTapInstalled = false
+        }
+
+        var format = inputNode.inputFormat(forBus: 0)
+        if format.sampleRate <= 0 || format.channelCount == 0 {
+            format = inputNode.outputFormat(forBus: 0)
+        }
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            state = .error("Microphone format unavailable. Try toggling AirPods or Restart the review.")
+            return
+        }
+
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             guard let self else { return }
             self.captureBuffer.append(buffer)
             if feedApple {
                 self.recognitionRequest?.append(buffer)
             }
-            // Energy VAD for OpenAI path (and as supplement).
             if self.captureBuffer.lastPeak >= self.speechEnergyThreshold {
                 Task { @MainActor in
-                    self.markSpeechActivity()
+                    self.markEnergySpeech()
                 }
             }
         }
+        micTapInstalled = true
 
         do {
-            audioEngine.prepare()
-            if !audioEngine.isRunning {
-                try configureAudioSession()
-                try audioEngine.start()
-            }
+            try audio.ensureEngineRunning()
         } catch {
-            // Retry once after a full session bounce — common with AirPods after TTS.
             do {
-                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-                try configureAudioSession()
-                audioEngine.prepare()
-                try audioEngine.start()
+                try await configureAudioSession(bounce: true)
+                try audio.ensureEngineRunning()
             } catch {
                 state = .error(friendlyAudioError(error))
             }
         }
+    }
+
+    private func removeMicTap() {
+        guard micTapInstalled else { return }
+        audio.inputNode.removeTap(onBus: 0)
+        micTapInstalled = false
     }
 
     private func friendlyAudioError(_ error: Error) -> String {
@@ -460,6 +557,10 @@ final class VoiceManager: NSObject, VoiceManaging {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(80))
                 guard let self, let client = self.realtimeClient, client.isConnected else { continue }
+                // Realtime API expects 24 kHz PCM. Hardware is often 48 kHz — skip rather
+                // than stream wrong-rate audio (which used to overwrite live captions).
+                let rate = self.captureBuffer.sampleRate
+                guard abs(rate - 24_000) < 50 else { continue }
                 let (chunk, newOffset) = self.captureBuffer.pcmSince(offset: self.pcmStreamOffset)
                 self.pcmStreamOffset = newOffset
                 if !chunk.isEmpty {
@@ -469,13 +570,45 @@ final class VoiceManager: NSObject, VoiceManaging {
         }
     }
 
-    private func markSpeechActivity() {
+    /// Loud mic energy — used to know someone is talking, but must not keep
+    /// resetting the end-of-turn clock on ambient hiss after they've stopped.
+    private func markEnergySpeech() {
+        let now = Date.now
+        if !hasReceivedSpeech {
+            hasReceivedSpeech = true
+            firstSpeechDate = now
+            lastSpeechDate = now
+            return
+        }
+        // Only extend "still speaking" when energy is clearly above the noise floor.
+        // Quiet room / AirPods idle sit near the threshold and used to prevent turn end.
+        if captureBuffer.lastPeak >= speechEnergyThreshold * 1.35 {
+            lastSpeechDate = now
+        }
+    }
+
+    private func markTranscriptProgress(previous: String, next: String) {
         let now = Date.now
         if !hasReceivedSpeech {
             hasReceivedSpeech = true
             firstSpeechDate = now
         }
-        lastSpeechDate = now
+        let prevNorm = Self.normalizeTranscript(previous)
+        let nextNorm = Self.normalizeTranscript(next)
+        if nextNorm != prevNorm {
+            lastSpeechDate = now
+            lastTranscriptChangeDate = now
+        } else if lastTranscriptChangeDate == nil {
+            lastTranscriptChangeDate = now
+            lastSpeechDate = lastSpeechDate ?? now
+        }
+    }
+
+    private static func normalizeTranscript(_ text: String) -> String {
+        text
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
     }
 
     func stopListening() async -> String {
@@ -500,22 +633,26 @@ final class VoiceManager: NSObject, VoiceManaging {
         if let player = audioPlayer, player.isPlaying {
             player.pause()
         }
+        // Soft-stop TTS node only — keep keep-alive for background audio entitlement.
         pcmPlayer?.stop()
-        if audioEngine.isRunning {
-            audioEngine.pause()
-        }
+        pcmPlayer = nil
         silenceTask?.cancel()
         state = .paused
+        audio.resumeKeepAliveAfterTTS()
     }
 
     func resume() {
+        Task {
+            try? await audio.reassert()
+        }
         if synthesizer.isPaused {
             synthesizer.continueSpeaking()
             state = .speaking
             return
         }
         do {
-            try audioEngine.start()
+            try audio.ensureEngineRunning()
+            audio.startKeepAlive()
             if let max = remainingMaxDuration() {
                 startSilenceMonitor(maxDuration: max)
             }
@@ -533,15 +670,12 @@ final class VoiceManager: NSObject, VoiceManaging {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
             if !text.isEmpty {
-                // Don't overwrite a richer OpenAI realtime caption unless Apple is the only source.
-                if realtimeClient?.isConnected != true {
-                    partialTranscript = text
-                    lastTranscript = text
-                } else if partialTranscript.isEmpty {
-                    partialTranscript = text
-                    lastTranscript = text
-                }
-                markSpeechActivity()
+                let previous = lastTranscript
+                // Apple re-delivers the same partial while you pause — only treat
+                // real caption growth as "still speaking" (OpenAI-style turn taking).
+                markTranscriptProgress(previous: previous, next: text)
+                partialTranscript = text
+                lastTranscript = text
             }
 
             if result.isFinal, !usingOpenAISTT {
@@ -567,7 +701,7 @@ final class VoiceManager: NSObject, VoiceManaging {
 
         silenceTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(200))
+                try? await Task.sleep(for: .milliseconds(80))
                 guard let self, !Task.isCancelled else { return }
 
                 let now = Date.now
@@ -576,22 +710,34 @@ final class VoiceManager: NSObject, VoiceManaging {
                     return
                 }
 
-                guard self.hasReceivedSpeech,
-                      let lastSpeech = self.lastSpeechDate,
-                      let firstSpeech = self.firstSpeechDate
-                else { continue }
+                let transcript = self.lastTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard self.hasReceivedSpeech, !transcript.isEmpty else { continue }
+
+                let lastSpeech = self.lastSpeechDate ?? self.firstSpeechDate ?? now
+                let firstSpeech = self.firstSpeechDate ?? lastSpeech
+                let lastChange = self.lastTranscriptChangeDate ?? lastSpeech
 
                 let spokenFor = lastSpeech.timeIntervalSince(firstSpeech)
-                let silentFor = now.timeIntervalSince(lastSpeech)
-                let isCommand = VoiceCommand.isCompleteCommand(self.lastTranscript)
+                let quietFor = now.timeIntervalSince(lastSpeech)
+                let stableFor = now.timeIntervalSince(lastChange)
+                let isCommand = VoiceCommand.isCompleteCommand(transcript)
 
                 if isCommand {
-                    if silentFor >= self.commandSilenceTimeout {
+                    if stableFor >= self.commandSilenceTimeout || quietFor >= self.commandSilenceTimeout {
                         await self.finalizeListening(preferOpenAI: self.usingOpenAISTT)
                         return
                     }
-                } else if spokenFor >= self.minimumSpeechDuration,
-                          silentFor >= self.silenceTimeout {
+                    continue
+                }
+
+                // Primary: caption stopped changing (what users experience as "I finished").
+                if stableFor >= self.transcriptStableTimeout {
+                    await self.finalizeListening(preferOpenAI: self.usingOpenAISTT)
+                    return
+                }
+
+                // Secondary: clear mic quiet after we've heard something.
+                if spokenFor >= self.minimumSpeechDuration, quietFor >= self.silenceTimeout {
                     await self.finalizeListening(preferOpenAI: self.usingOpenAISTT)
                     return
                 }
@@ -613,28 +759,44 @@ final class VoiceManager: NSObject, VoiceManaging {
         state = .processing
 
         recognitionRequest?.endAudio()
-        if audioEngine.isRunning {
-            audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
-        }
+        // Keep shared engine + keep-alive running through STT/grade (locked walks).
+        removeMicTap()
+        audio.resumeKeepAliveAfterTTS()
 
+        // Start from Apple live text only — never prefer realtime (often wrong sample rate).
         var text = lastTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        await realtimeClient?.commit()
 
-        if preferOpenAI, let stt = settings.makeOpenAISTTProvider {
-            await realtimeClient?.commit()
-            if let live = realtimeClient?.latestTranscript, !live.isEmpty {
-                text = live
-                partialTranscript = live
-            }
-
+        // When locked / inactive, skip OpenAI STT and trust Apple (often on-device).
+        let allowCloudSTT = preferOpenAI && !preferOnDeviceRecognition
+        if allowCloudSTT, let stt = settings.makeOpenAISTTProvider {
             let wav = captureBuffer.wavData
-            do {
-                let precise = try await stt.transcribe(wavData: wav)
-                if !precise.isEmpty {
-                    text = precise
+            let duration = captureBuffer.durationSeconds
+            if duration >= 0.2, wav.count > 2_000 {
+                let prompt = OpenAITranscriptionProvider.prompt(
+                    cardQuestion: sttQuestionHint,
+                    expectedAnswer: sttExpectedAnswerHint,
+                    extraTerms: sttVocabularyHints
+                )
+                do {
+                    let precise = try await withThrowingTaskGroup(of: String.self) { group in
+                        group.addTask {
+                            try await stt.transcribe(wavData: wav, prompt: prompt)
+                        }
+                        group.addTask {
+                            try await Task.sleep(for: .milliseconds(2_400))
+                            throw CancellationError()
+                        }
+                        let first = try await group.next()!
+                        group.cancelAll()
+                        return first
+                    }
+                    if !precise.isEmpty {
+                        text = precise
+                    }
+                } catch {
+                    // Keep Apple transcript.
                 }
-            } catch {
-                // Keep realtime / Apple transcript.
             }
         }
 
@@ -665,10 +827,8 @@ final class VoiceManager: NSObject, VoiceManaging {
         realtimeClient?.close()
         realtimeClient = nil
 
-        if audioEngine.isRunning {
-            audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
-        }
+        removeMicTap()
+        // Do not stop the shared engine — keep-alive must survive cancel mid-turn.
 
         if resumeListenContinuation, let continuation = listenContinuation {
             listenContinuation = nil
@@ -727,13 +887,23 @@ final class VoiceManager: NSObject, VoiceManaging {
 
         switch type {
         case .began:
+            wasSpeakingAtInterruption = (state == .speaking)
             pause()
         case .ended:
             let options = (info[AVAudioSessionInterruptionOptionKey] as? UInt)
                 .map(AVAudioSession.InterruptionOptions.init(rawValue:)) ?? []
             if options.contains(.shouldResume) {
-                try? configureAudioSession()
-                resume()
+                Task { @MainActor in
+                    try? await self.audio.reassert()
+                    if self.wasSpeakingAtInterruption {
+                        // PCM can't resume mid-stream — ask the session to re-speak the card.
+                        self.promptReplayRequested = true
+                        self.wasSpeakingAtInterruption = false
+                        self.state = .idle
+                    } else {
+                        self.resume()
+                    }
+                }
             }
         @unknown default:
             break
@@ -746,12 +916,20 @@ final class VoiceManager: NSObject, VoiceManaging {
               let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue)
         else { return }
 
-        guard state != .speaking else { return }
-
         if reason == .oldDeviceUnavailable || reason == .newDeviceAvailable {
-            try? configureAudioSession()
-            if state == .listening, !audioEngine.isRunning {
-                try? audioEngine.start()
+            Task { @MainActor in
+                let wasSpeaking = self.state == .speaking
+                try? await self.audio.reassert()
+                if wasSpeaking {
+                    self.promptReplayRequested = true
+                    self.stopCurrentSpeech(resumeContinuation: true)
+                } else if self.state == .listening {
+                    try? self.audio.ensureEngineRunning()
+                    self.audio.startKeepAlive()
+                    if !self.micTapInstalled {
+                        await self.installCaptureTap(feedApple: self.recognitionRequest != nil)
+                    }
+                }
             }
         }
     }

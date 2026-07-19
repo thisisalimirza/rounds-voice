@@ -27,12 +27,21 @@ final class DeckImportViewModel {
 
         do {
             progressMessage = "Parsing notes & AnKing note types…"
+            // Reminder is also on the import overlay — keep progress copy honest.
             let imported = try await importer.importDeck(from: url)
             lastReport = imported.importReport
 
-            progressMessage = "Saving \(imported.notes.count) notes…"
-            let deck = try DeckPersistence.persist(imported, into: context)
-            try context.save()
+            let totalNotes = imported.notes.count
+            progressMessage = "Saving 0 / \(totalNotes) notes — keep the app open…"
+
+            let deck = try await DeckPersistence.persist(
+                imported,
+                into: context,
+                batchSize: 200,
+                onProgress: { [weak self] done, total in
+                    self?.progressMessage = "Saving \(done) / \(total) notes — keep the app open…"
+                }
+            )
 
             let cardCount = deck.totalCardCount
             successMessage = "Imported “\(deck.name)” · \(cardCount) voice cards"

@@ -39,19 +39,39 @@ struct OpenAITranscriptionProvider: Sendable {
         self.baseURL = baseURL
     }
 
-    static let medicalPrompt = """
-    Medical student answering Anki / AnKing flashcards aloud while walking. \
-    Prefer correct drug names, anatomy, physiology, and abbreviations \
-    (e.g. metformin, vancomycin, AMPK, gluconeogenesis, ACE inhibitor, ARB, NSAID, INR, D-Ala-D-Ala). \
-    Voice commands may appear alone: repeat, skip, pause, explain, I don't know, idk. \
-    Transcribe exactly what was said; keep medical spelling accurate.
+    static let medicalBasePrompt = """
+    You are transcribing a medical student answering Anki / AnKing flashcards out loud. \
+    Prefer correct clinical spelling for drugs, enzymes, pathways, anatomy, and abbreviations \
+    (metformin, vancomycin, AMPK, gluconeogenesis, ACE inhibitor, ARB, NSAID, INR, D-Ala-D-Ala, \
+    ultrasound, appendicitis, pregnancy, beta blocker, calcium channel blocker). \
+    Keep filler like um/uh if present. Voice commands may appear alone: repeat, skip, pause, explain, I don't know, idk.
     """
 
-    func transcribe(wavData: Data, prompt: String = OpenAITranscriptionProvider.medicalPrompt) async throws -> String {
+    static func prompt(cardQuestion: String, expectedAnswer: String, extraTerms: [String] = []) -> String {
+        var parts = [medicalBasePrompt]
+        let q = cardQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        let a = expectedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !q.isEmpty {
+            parts.append("Flashcard prompt: \(q)")
+        }
+        if !a.isEmpty {
+            parts.append("Likely answer vocabulary (do not invent — only use if heard): \(a)")
+        }
+        let terms = extraTerms
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.count > 2 }
+        if !terms.isEmpty {
+            parts.append("Keywords: " + terms.prefix(40).joined(separator: ", "))
+        }
+        return parts.joined(separator: " ")
+    }
+
+    func transcribe(wavData: Data, prompt: String) async throws -> String {
         guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw STTProviderError.missingAPIKey
         }
-        guard wavData.count > 44 else { throw STTProviderError.emptyAudio }
+        // ~0.25s of 16-bit mono at 16 kHz ≈ 8 KB; reject near-empty captures.
+        guard wavData.count > 2_000 else { throw STTProviderError.emptyAudio }
 
         let boundary = "Boundary-\(UUID().uuidString)"
         var request = URLRequest(url: baseURL.appending(path: "audio/transcriptions"))
@@ -73,7 +93,8 @@ struct OpenAITranscriptionProvider: Sendable {
         appendField("model", model)
         appendField("language", "en")
         appendField("response_format", "json")
-        appendField("prompt", prompt)
+        // Keep prompt bounded — API truncates extremely long prompts anyway.
+        appendField("prompt", String(prompt.prefix(2_000)))
 
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
         body.append("Content-Disposition: form-data; name=\"file\"; filename=\"answer.wav\"\r\n".data(using: .utf8)!)

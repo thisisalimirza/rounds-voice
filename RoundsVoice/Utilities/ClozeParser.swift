@@ -67,10 +67,11 @@ enum ClozeParser {
     private static func blankToken(hint: String?, style: BlankStyle) -> String {
         switch style {
         case .spoken:
-            if let hint, !hint.isEmpty { return "blank (\(hint))" }
+            // Never speak the hint — AnKing often puts the answer (or a giveaway like "B6")
+            // in the hint slot. Screen can still show [hint]; ears only hear "blank".
+            _ = hint
             return "blank"
         case .display:
-            // Match Anki’s cloze UI so eyes and ears stay consistent with study habits.
             if let hint, !hint.isEmpty { return "[\(hint)]" }
             return "[...]"
         }

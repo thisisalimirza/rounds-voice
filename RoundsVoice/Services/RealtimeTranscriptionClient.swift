@@ -51,8 +51,8 @@ final class RealtimeTranscriptionClient: NSObject {
                         "transcription": [
                             "model": "gpt-realtime-whisper",
                             "language": "en",
-                            // Favor medical accuracy slightly over the absolute fastest captions.
-                            "delay": "high"
+                            // Live captions should feel snappy; final answer uses gpt-4o-transcribe.
+                            "delay": "low"
                         ]
                     ] as [String: Any]
                 ]
