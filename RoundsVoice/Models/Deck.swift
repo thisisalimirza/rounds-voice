@@ -12,6 +12,12 @@ final class Deck {
     var updatedAt: Date
     var lastReviewedAt: Date?
 
+    /// Denormalized counters — never derive these from `cards` for large decks.
+    var cardCount: Int = 0
+    var dueCount: Int = 0
+    var suspendedCount: Int = 0
+    var countsRefreshedAt: Date?
+
     @Relationship(deleteRule: .cascade, inverse: \Card.deck)
     var cards: [Card]
 
@@ -28,18 +34,17 @@ final class Deck {
         self.deckDescription = deckDescription
         self.source = source
         self.cards = cards
+        self.cardCount = cards.count
+        self.dueCount = cards.filter { !$0.isSuspended && $0.dueDate <= .now }.count
+        self.suspendedCount = cards.filter(\.isSuspended).count
+        self.countsRefreshedAt = .now
         self.createdAt = .now
         self.updatedAt = .now
         self.lastReviewedAt = lastReviewedAt
     }
 
-    var dueCardCount: Int {
-        cards.filter(\.isDue).count
-    }
-
-    var totalCardCount: Int {
-        cards.count
-    }
+    var dueCardCount: Int { dueCount }
+    var totalCardCount: Int { cardCount }
 }
 
 enum DeckSource: String, Codable, CaseIterable, Sendable {

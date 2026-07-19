@@ -157,13 +157,13 @@ struct OpenAITTSProvider: Sendable {
                     )
                     request.timeoutInterval = 90
 
-                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    let (byteStream, response) = try await URLSession.shared.bytes(for: request)
                     guard let http = response as? HTTPURLResponse else {
                         throw TTSProviderError.invalidResponse
                     }
                     guard (200..<300).contains(http.statusCode) else {
                         var errorData = Data()
-                        for try await byte in bytes {
+                        for try await byte in byteStream {
                             errorData.append(byte)
                             if errorData.count > 4_096 { break }
                         }
@@ -171,19 +171,28 @@ struct OpenAITTSProvider: Sendable {
                         throw TTSProviderError.httpError(statusCode: http.statusCode, body: bodyText)
                     }
 
-                    var chunk = Data()
-                    chunk.reserveCapacity(8_192)
-                    for try await byte in bytes {
-                        chunk.append(byte)
-                        // ~20 ms of 24 kHz mono 16-bit ≈ 960 bytes; send ~40 ms chunks.
-                        if chunk.count >= 1_920 {
-                            continuation.yield(chunk)
-                            chunk = Data()
-                            chunk.reserveCapacity(8_192)
+                    // Read ~8 KB at a time (≈170 ms @ 24 kHz). Byte-by-byte iteration
+                    // was a major source of scheduling jitter / underruns.
+                    var buffer = Data()
+                    buffer.reserveCapacity(16_384)
+                    for try await byte in byteStream {
+                        buffer.append(byte)
+                        if buffer.count >= 8_192 {
+                            // Keep 16-bit PCM frames aligned.
+                            let aligned = buffer.count - (buffer.count % 2)
+                            if aligned > 0 {
+                                continuation.yield(Data(buffer.prefix(aligned)))
+                                if aligned < buffer.count {
+                                    buffer = Data(buffer.suffix(from: aligned))
+                                } else {
+                                    buffer.removeAll(keepingCapacity: true)
+                                }
+                            }
                         }
                     }
-                    if !chunk.isEmpty {
-                        continuation.yield(chunk)
+                    if buffer.count >= 2 {
+                        let aligned = buffer.count - (buffer.count % 2)
+                        continuation.yield(Data(buffer.prefix(aligned)))
                     }
                     continuation.finish()
                 } catch {

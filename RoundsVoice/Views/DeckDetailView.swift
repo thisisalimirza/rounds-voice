@@ -12,11 +12,9 @@ struct DeckDetailView: View {
     @State private var renameText = ""
     @State private var showDeleteConfirm = false
     @State private var listViewModel = DeckListViewModel()
+    @State private var sampleCards: [Card] = []
 
-    private var dueCount: Int { deck.dueCardCount }
-    private var sampleCards: [Card] {
-        Array(deck.cards.sorted { $0.dueDate < $1.dueDate }.prefix(4))
-    }
+    private var dueCount: Int { deck.dueCount }
 
     var body: some View {
         ZStack {
@@ -86,7 +84,10 @@ struct DeckDetailView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Removes \(deck.totalCardCount) cards from Rounds Voice. Your Anki file is unchanged.")
+            Text("Removes \(deck.cardCount) cards from Rounds Voice. Your Anki file is unchanged.")
+        }
+        .task {
+            await loadPreview()
         }
         .onAppear { appeared = true }
     }
@@ -110,8 +111,11 @@ struct DeckDetailView: View {
             }
 
             HStack(spacing: RVTheme.Spacing.xl) {
-                metric(value: "\(deck.totalCardCount)", label: "Cards")
+                metric(value: "\(deck.cardCount)", label: "Cards")
                 metric(value: "\(dueCount)", label: "Due now")
+                if deck.suspendedCount > 0 {
+                    metric(value: "\(deck.suspendedCount)", label: "Suspended")
+                }
             }
             .padding(.top, RVTheme.Spacing.sm)
         }
@@ -153,8 +157,8 @@ struct DeckDetailView: View {
             }
         }
         .buttonStyle(.plain)
-        .disabled(deck.cards.isEmpty)
-        .opacity(deck.cards.isEmpty ? 0.5 : 1)
+        .disabled(deck.cardCount == 0)
+        .opacity(deck.cardCount == 0 ? 0.5 : 1)
     }
 
     private var manageRow: some View {
@@ -168,7 +172,7 @@ struct DeckDetailView: View {
                     Text("Browse & manage cards")
                         .font(RVTheme.Typography.headline)
                         .foregroundStyle(.primary)
-                    Text("Search, filter due, delete cards")
+                    Text("Search, edit, suspend, delete")
                         .font(RVTheme.Typography.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -233,11 +237,11 @@ struct DeckDetailView: View {
                 .rvReveal(index: 4 + index, appeared: appeared)
             }
 
-            if deck.totalCardCount > sampleCards.count {
+            if deck.cardCount > sampleCards.count {
                 NavigationLink {
                     CardBrowserView(deck: deck)
                 } label: {
-                    Text("View all \(deck.totalCardCount) cards")
+                    Text("View all \(deck.cardCount) cards")
                         .font(RVTheme.Typography.headline)
                         .foregroundStyle(RVTheme.seafoam)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -263,6 +267,19 @@ struct DeckDetailView: View {
             Text(label)
                 .font(RVTheme.Typography.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    @MainActor
+    private func loadPreview() async {
+        do {
+            var due = try CardQuery.fetchDue(deckID: deck.id, limit: 4, context: modelContext)
+            if due.isEmpty {
+                due = try CardQuery.fetchUpcoming(deckID: deck.id, limit: 4, context: modelContext)
+            }
+            sampleCards = due
+        } catch {
+            sampleCards = []
         }
     }
 }

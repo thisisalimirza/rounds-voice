@@ -369,9 +369,10 @@ enum DeckPersistence {
             await Task.yield()
         }
 
-        guard !deck.cards.isEmpty else {
+        guard deck.cardCount > 0 else {
             throw DeckImportError.emptyDeck
         }
+        deck.countsRefreshedAt = .now
         return deck
     }
 
@@ -403,9 +404,10 @@ enum DeckPersistence {
             onProgress?(index, total)
         }
 
-        guard !deck.cards.isEmpty else {
+        guard deck.cardCount > 0 else {
             throw DeckImportError.emptyDeck
         }
+        deck.countsRefreshedAt = .now
         return deck
     }
 
@@ -443,8 +445,9 @@ enum DeckPersistence {
         for card in cards {
             card.imageAttachments = note.imageAttachments
             card.deck = deck
-            deck.cards.append(card)
+            // Avoid `deck.cards.append` — that materializes the full relationship in RAM.
             context.insert(card)
+            DeckStats.noteInserted(card: card, into: deck)
         }
     }
 }

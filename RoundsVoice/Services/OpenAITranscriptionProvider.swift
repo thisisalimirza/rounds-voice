@@ -50,19 +50,27 @@ struct OpenAITranscriptionProvider: Sendable {
     static func prompt(cardQuestion: String, expectedAnswer: String, extraTerms: [String] = []) -> String {
         var parts = [medicalBasePrompt]
         let q = cardQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
-        let a = expectedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
         if !q.isEmpty {
-            parts.append("Flashcard prompt: \(q)")
+            parts.append("Flashcard topic: \(String(q.prefix(160)))")
         }
-        if !a.isEmpty {
-            parts.append("Likely answer vocabulary (do not invent — only use if heard): \(a)")
-        }
-        let terms = extraTerms
+        // Never paste the full expected answer — models hallucinate it on silence/noise.
+        // Only pass short vocabulary tokens.
+        var terms = extraTerms
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { $0.count > 2 }
-        if !terms.isEmpty {
-            parts.append("Keywords: " + terms.prefix(40).joined(separator: ", "))
+        let answerTokens = expectedAnswer
+            .split(whereSeparator: { $0.isWhitespace || $0 == "/" || $0 == "-" || $0 == "," })
+            .map(String.init)
+            .filter { $0.count >= 3 }
+        for token in answerTokens where terms.count < 40 {
+            if !terms.contains(where: { $0.caseInsensitiveCompare(token) == .orderedSame }) {
+                terms.append(token)
+            }
         }
+        if !terms.isEmpty {
+            parts.append("Possible clinical terms (transcribe only if clearly heard): " + terms.prefix(40).joined(separator: ", "))
+        }
+        parts.append("If the audio is silent or unintelligible, return an empty transcription.")
         return parts.joined(separator: " ")
     }
 

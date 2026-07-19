@@ -51,13 +51,29 @@ final class ReviewSessionViewModel {
     }
 
     func start() {
-        queue = scheduler.dueCards(from: deck.cards)
-        if queue.isEmpty {
-            queue = deck.cards.sorted { $0.dueDate < $1.dueDate }
+        errorMessage = nil
+        guard let context = deck.modelContext else {
+            queue = []
+            status = .finished
+            errorMessage = "Couldn't open this deck's cards."
+            return
         }
+
+        // Never materialize all 40k cards — session queue is a bounded due fetch.
+        let sessionLimit = 60
+        do {
+            var due = try CardQuery.fetchDue(deckID: deck.id, limit: sessionLimit, context: context)
+            if due.isEmpty {
+                due = try CardQuery.fetchUpcoming(deckID: deck.id, limit: min(20, sessionLimit), context: context)
+            }
+            queue = due
+        } catch {
+            queue = []
+            errorMessage = error.localizedDescription
+        }
+
         stats = ReviewSessionStats()
         status = .idle
-        errorMessage = nil
         needsPermissions = false
         liveTranscript = ""
         isSuspended = false
@@ -272,7 +288,32 @@ final class ReviewSessionViewModel {
             status = .speaking
             publishSessionChrome()
             prefetchNextPrompt(after: card)
-            try await voice.speak(card.spokenQuestion)
+            voice.prepareAnswerContext(
+                question: card.spokenQuestion,
+                expectedAnswer: card.spokenAnswer
+            )
+
+            startCaptionPolling()
+            let transcript: String
+            do {
+                transcript = try await voice.speakPromptAndCollectAnswer(
+                    prompt: card.spokenQuestion,
+                    maxDuration: 28
+                )
+            } catch is CancellationError {
+                stopCaptionPolling()
+                throw CancellationError()
+            } catch {
+                stopCaptionPolling()
+                // Fallback: classic speak-then-listen if combined path fails.
+                try await voice.speak(card.spokenQuestion)
+                transcript = await collectAnswer()
+            }
+            stopCaptionPolling()
+            lastTranscript = transcript
+            liveTranscript = transcript
+            publishSessionChrome()
+
             guard !Task.isCancelled else { return false }
 
             if voice.consumePromptReplayRequest() {
@@ -282,19 +323,6 @@ final class ReviewSessionViewModel {
             await waitIfSuspended()
             guard !Task.isCancelled else { return false }
 
-            prefetchNextPrompt(after: card)
-            voice.prepareAnswerContext(
-                question: card.spokenQuestion,
-                expectedAnswer: card.spokenAnswer
-            )
-
-            let transcript = await collectAnswer()
-            stopCaptionPolling()
-            lastTranscript = transcript
-            liveTranscript = transcript
-            publishSessionChrome()
-
-            guard !Task.isCancelled else { return false }
             guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 try? await voice.speak("I didn't catch that. Let's try again.")
                 return await present(card: card)
@@ -392,9 +420,13 @@ final class ReviewSessionViewModel {
                 let partial = self.voice.partialTranscript
                 if partial != self.liveTranscript {
                     self.liveTranscript = partial
-                    if self.status == .listening {
+                    if self.status == .listening || self.status == .speaking {
                         self.publishSessionChrome()
                     }
+                }
+                if self.voice.state == .listening, self.status == .speaking {
+                    self.status = .listening
+                    self.publishSessionChrome()
                 }
                 if self.status == .listening, self.voice.state == .processing {
                     self.status = .thinking

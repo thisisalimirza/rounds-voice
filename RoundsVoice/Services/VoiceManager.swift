@@ -57,6 +57,8 @@ protocol VoiceManaging: AnyObject {
     func requestPermissions() async -> Bool
     func speak(_ text: String) async throws
     func prefetchSpeech(_ text: String)
+    /// Arms the mic *during* the prompt so listening is instant (and barge-in mid-question works).
+    func speakPromptAndCollectAnswer(prompt: String, maxDuration: TimeInterval) async throws -> String
     /// Convenience: arm mic, then wait for an utterance.
     func listenForAnswer(maxDuration: TimeInterval) async throws -> String
     /// Start the mic / recognizer. Only returns once capture is actually running.
@@ -77,13 +79,17 @@ final class VoiceManager: NSObject, VoiceManaging {
     private(set) var promptReplayRequested = false
 
     /// End-of-answer silence before we finalize (snappy turn-taking).
-    var silenceTimeout: TimeInterval = 0.75
-    var commandSilenceTimeout: TimeInterval = 0.28
-    var minimumSpeechDuration: TimeInterval = 0.15
+    var silenceTimeout: TimeInterval = 0.85
+    var commandSilenceTimeout: TimeInterval = 0.35
+    var minimumSpeechDuration: TimeInterval = 0.25
     /// How long the caption must stay unchanged before we treat the utterance as done.
-    var transcriptStableTimeout: TimeInterval = 0.70
+    var transcriptStableTimeout: TimeInterval = 0.85
     /// Peak above this counts as real speech energy (above AirPods hiss / room noise).
-    var speechEnergyThreshold: Float = 0.028
+    var speechEnergyThreshold: Float = 0.045
+    /// Stronger peak required before we believe the user actually spoke.
+    var credibleSpeechPeak: Float = 0.06
+    /// Ignore mic/captions briefly after arming (route switch + earcon settle).
+    var listenSettleDuration: TimeInterval = 0.55
 
     private let synthesizer = AVSpeechSynthesizer()
     private var audioPlayer: AVAudioPlayer?
@@ -119,6 +125,11 @@ final class VoiceManager: NSObject, VoiceManaging {
     private var hasReceivedSpeech = false
     private var playbackWatchdog: Task<Void, Never>?
     private var finishListenTask: Task<Void, Never>?
+    /// True while the card prompt is still playing — silence monitor must not finalize yet.
+    private var promptPlaybackActive = false
+    private var didBargeIn = false
+    /// Captions seen during settle are discarded so route noise can't auto-advance.
+    private var listenSettleUntil: Date?
 
     private var interruptionObserver: NSObjectProtocol?
     private var routeChangeObserver: NSObjectProtocol?
@@ -202,7 +213,7 @@ final class VoiceManager: NSObject, VoiceManaging {
     private func prepareForListening() async throws {
         stopCurrentSpeech(resumeContinuation: false)
         try await configureAudioSession(bounce: false)
-        audio.resumeKeepAliveAfterTTS()
+        audio.pauseKeepAliveForListening()
     }
 
     func requestPermissions() async -> Bool {
@@ -221,12 +232,13 @@ final class VoiceManager: NSObject, VoiceManaging {
 
     func speak(_ text: String) async throws {
         cancelListeningPipeline(resumeListenContinuation: true)
+        promptPlaybackActive = false
+        didBargeIn = false
         stopCurrentSpeech(resumeContinuation: true)
+        removeMicTap()
         speakGeneration += 1
         let generation = speakGeneration
         state = .speaking
-
-        try await configureAudioSession(bounce: false)
 
         if let provider = settings.makeOpenAITTSProvider {
             do {
@@ -234,18 +246,84 @@ final class VoiceManager: NSObject, VoiceManaging {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                // One retry after a full session bounce — don't immediately dump to Siri.
                 guard generation == speakGeneration else { throw CancellationError() }
-                try await speakWithApple(text)
+                do {
+                    try await audio.configureSession(bounce: true)
+                    try await speakWithOpenAI(text, provider: provider, generation: generation)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    guard generation == speakGeneration else { throw CancellationError() }
+                    try await audio.configureSession(bounce: false)
+                    try await speakWithApple(text)
+                }
             }
         } else {
+            try await audio.configureSession(bounce: false)
             try await speakWithApple(text)
         }
 
         guard generation == speakGeneration else { throw CancellationError() }
-        // Stop TTS only — do NOT bounce the session here. Bouncing + sleeping after
-        // speak() made the UI say "Listening" while the mic was still cold, which
-        // clipped the first word of nearly every answer.
         stopCurrentSpeech(resumeContinuation: false)
+        audio.resumeKeepAliveAfterTTS()
+    }
+
+    /// Smooth TTS prompt, then arm the mic immediately.
+    func speakPromptAndCollectAnswer(prompt: String, maxDuration: TimeInterval = 28) async throws -> String {
+        cancelListeningPipeline(resumeListenContinuation: true)
+        stopCurrentSpeech(resumeContinuation: true)
+        removeMicTap()
+
+        lastTranscript = ""
+        partialTranscript = ""
+        lastSpeechDate = nil
+        firstSpeechDate = nil
+        lastTranscriptChangeDate = nil
+        hasReceivedSpeech = false
+        listenStartedAt = .now
+        pcmStreamOffset = 0
+        captureBuffer.reset()
+        usingOpenAISTT = settings.shouldUseOpenAISTT
+        didBargeIn = false
+        promptPlaybackActive = false
+        state = .speaking
+
+        speakGeneration += 1
+        let generation = speakGeneration
+        do {
+            if let provider = settings.makeOpenAITTSProvider {
+                do {
+                    try await speakWithOpenAI(prompt, provider: provider, generation: generation)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    guard generation == speakGeneration else { throw CancellationError() }
+                    do {
+                        try await audio.configureSession(bounce: true)
+                        try await speakWithOpenAI(prompt, provider: provider, generation: generation)
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        guard generation == speakGeneration else { throw CancellationError() }
+                        try await audio.configureSession(bounce: false)
+                        try await speakWithApple(prompt)
+                    }
+                }
+            } else {
+                try await audio.configureSession(bounce: false)
+                try await speakWithApple(prompt)
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        }
+
+        guard generation == speakGeneration else { throw CancellationError() }
+        stopCurrentSpeech(resumeContinuation: false)
+
+        try await audio.prepareForListeningCapture()
+        try await startListening(playReadyCue: false)
+        return try await awaitAnswer(maxDuration: maxDuration)
     }
 
     func prefetchSpeech(_ text: String) {
@@ -282,7 +360,7 @@ final class VoiceManager: NSObject, VoiceManaging {
         // Stream for low time-to-first-audio; also assemble for cache.
         let player = PCMStreamPlayer()
         pcmPlayer = player
-        try player.start()
+        try await player.start()
 
         var assembled = Data()
         assembled.reserveCapacity(64_000)
@@ -323,13 +401,12 @@ final class VoiceManager: NSObject, VoiceManaging {
     private func playPCMData(_ data: Data, generation: Int) async throws {
         let player = PCMStreamPlayer()
         pcmPlayer = player
-        try player.start()
-        // Schedule in chunks so the engine stays responsive.
-        let chunkSize = 4_800
+        try await player.start()
+        // Schedule in larger chunks so the engine stays ahead of the playhead.
+        let chunkSize = 9_600 // ~200 ms @ 24 kHz mono Int16
         var offset = 0
         while offset < data.count {
             let end = min(offset + chunkSize, data.count)
-            // Align to 2 bytes.
             let alignedEnd = end - ((end - offset) % 2)
             if alignedEnd > offset {
                 player.schedulePCM(data.subdata(in: offset..<alignedEnd))
@@ -348,8 +425,8 @@ final class VoiceManager: NSObject, VoiceManaging {
         utterance.voice = preferredEnglishVoice()
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate * 0.95
         utterance.pitchMultiplier = 1.0
-        utterance.preUtteranceDelay = 0.02
-        utterance.postUtteranceDelay = 0.04
+        utterance.preUtteranceDelay = 0
+        utterance.postUtteranceDelay = 0
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             self.speechContinuation = continuation
@@ -394,6 +471,10 @@ final class VoiceManager: NSObject, VoiceManaging {
     }
 
     func startListening() async throws {
+        try await startListening(playReadyCue: true)
+    }
+
+    func startListening(playReadyCue: Bool) async throws {
         cancelListeningPipeline(resumeListenContinuation: false)
 
         lastTranscript = ""
@@ -403,10 +484,12 @@ final class VoiceManager: NSObject, VoiceManaging {
         lastTranscriptChangeDate = nil
         hasReceivedSpeech = false
         listenStartedAt = .now
+        listenSettleUntil = Date.now.addingTimeInterval(listenSettleDuration)
         pcmStreamOffset = 0
         captureBuffer.reset()
         usingOpenAISTT = settings.shouldUseOpenAISTT
-        // Stay idle until the mic is actually running.
+        promptPlaybackActive = false
+        didBargeIn = false
         state = .idle
 
         try await prepareForListening()
@@ -421,16 +504,26 @@ final class VoiceManager: NSObject, VoiceManaging {
             throw VoiceError.audioEngineFailed("Microphone failed to start.")
         }
 
+        // Drop any audio captured during engine restart / route flip.
+        captureBuffer.reset()
+        lastTranscript = ""
+        partialTranscript = ""
+        hasReceivedSpeech = false
+        listenStartedAt = .now
+        listenSettleUntil = Date.now.addingTimeInterval(listenSettleDuration)
+
         state = .listening
-        signalMicReady()
+        signalMicReady(hapticOnly: !playReadyCue)
     }
 
-    private func signalMicReady() {
-        audio.playMicReadyEarcon()
+    private func signalMicReady(hapticOnly: Bool) {
+        if !hapticOnly {
+            audio.playMicReadyEarcon()
+        }
         #if canImport(UIKit)
         let generator = UIImpactFeedbackGenerator(style: .light)
         generator.prepare()
-        generator.impactOccurred(intensity: 0.55)
+        generator.impactOccurred(intensity: hapticOnly ? 0.4 : 0.55)
         #endif
     }
 
@@ -492,14 +585,28 @@ final class VoiceManager: NSObject, VoiceManaging {
     }
 
     private func installCaptureTap(feedApple: Bool) async {
+        // Avoid reconfigure+restart when the mic is already hot — that was the
+        // multi-hundred-ms gap after every prompt.
+        if micTapInstalled, audio.isEngineRunning {
+            audio.pauseKeepAliveForListening()
+            return
+        }
+
         try? await configureAudioSession(bounce: false)
-        audio.resumeKeepAliveAfterTTS()
+        audio.pauseKeepAliveForListening()
 
         let inputNode = audio.inputNode
-        // Soft reinstall — never reset/stop the shared engine (that kills keep-alive).
         if micTapInstalled {
             inputNode.removeTap(onBus: 0)
             micTapInstalled = false
+        }
+
+        if inputNode.isVoiceProcessingEnabled {
+            do {
+                try inputNode.setVoiceProcessingEnabled(false)
+            } catch {
+                // Best-effort.
+            }
         }
 
         var format = inputNode.inputFormat(forBus: 0)
@@ -526,13 +633,43 @@ final class VoiceManager: NSObject, VoiceManaging {
         micTapInstalled = true
 
         do {
-            try audio.ensureEngineRunning()
+            try audio.restartEngine()
         } catch {
             do {
                 try await configureAudioSession(bounce: true)
-                try audio.ensureEngineRunning()
+                try audio.restartEngine()
             } catch {
                 state = .error(friendlyAudioError(error))
+            }
+        }
+    }
+
+    /// New Apple recognition request without tearing down the mic tap (post-prompt / barge-in).
+    private func refreshRecognitionKeepingTap() async {
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        recognitionRequest?.endAudio()
+        recognitionRequest = nil
+
+        guard let recognizer = speechRecognizer, recognizer.isAvailable else { return }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.requiresOnDeviceRecognition = preferOnDeviceRecognition && recognizer.supportsOnDeviceRecognition
+        request.taskHint = .dictation
+        var context = [
+            "metformin", "AMPK", "gluconeogenesis", "vancomycin", "warfarin",
+            "atorvastatin", "metoprolol", "lisinopril", "losartan", "spironolactone",
+            "appendicitis", "ultrasound", "MRI", "CT", "pregnancy",
+            "repeat", "skip", "pause", "explain", "I don't know"
+        ]
+        context.append(contentsOf: sttVocabularyHints)
+        request.contextualStrings = Array(context.prefix(100))
+        recognitionRequest = request
+        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self else { return }
+            Task { @MainActor in
+                self.handleAppleRecognition(result: result, error: error)
             }
         }
     }
@@ -573,6 +710,14 @@ final class VoiceManager: NSObject, VoiceManaging {
     /// Loud mic energy — used to know someone is talking, but must not keep
     /// resetting the end-of-turn clock on ambient hiss after they've stopped.
     private func markEnergySpeech() {
+        if isInListenSettle { return }
+        if promptPlaybackActive {
+            considerBargeIn(fromTranscript: false)
+            return
+        }
+        // Ambient AirPods hiss used to flip hasReceivedSpeech and auto-advance.
+        guard captureBuffer.lastPeak >= credibleSpeechPeak else { return }
+
         let now = Date.now
         if !hasReceivedSpeech {
             hasReceivedSpeech = true
@@ -580,14 +725,16 @@ final class VoiceManager: NSObject, VoiceManaging {
             lastSpeechDate = now
             return
         }
-        // Only extend "still speaking" when energy is clearly above the noise floor.
-        // Quiet room / AirPods idle sit near the threshold and used to prevent turn end.
         if captureBuffer.lastPeak >= speechEnergyThreshold * 1.35 {
             lastSpeechDate = now
         }
     }
 
     private func markTranscriptProgress(previous: String, next: String) {
+        if isInListenSettle { return }
+        if promptPlaybackActive {
+            considerBargeIn(fromTranscript: true)
+        }
         let now = Date.now
         if !hasReceivedSpeech {
             hasReceivedSpeech = true
@@ -602,6 +749,70 @@ final class VoiceManager: NSObject, VoiceManaging {
             lastTranscriptChangeDate = now
             lastSpeechDate = lastSpeechDate ?? now
         }
+    }
+
+    private var isInListenSettle: Bool {
+        guard let until = listenSettleUntil else { return false }
+        return Date.now < until
+    }
+
+    /// True when mic energy + caption look like a real utterance (not hiss / hallucination bait).
+    private var heardCredibleUtterance: Bool {
+        let transcript = Self.normalizeTranscript(lastTranscript)
+        guard transcript.count >= 2 else { return false }
+        // Require either clear mic energy or a multi-word / longer caption.
+        let strongEnergy = captureBuffer.maxPeak >= credibleSpeechPeak
+        let substantialText = transcript.count >= 4 || transcript.contains(" ")
+        return strongEnergy || substantialText
+    }
+
+    /// Cut the prompt short when the user starts answering early.
+    private func considerBargeIn(fromTranscript: Bool) {
+        guard promptPlaybackActive, !didBargeIn else { return }
+
+        let text = Self.normalizeTranscript(lastTranscript)
+        let prompt = Self.normalizeTranscript(sttQuestionHint)
+
+        if fromTranscript {
+            // Ignore echo of the prompt itself (speakerphone bleed).
+            guard text.count >= 2 else { return }
+            if !prompt.isEmpty, prompt.contains(text) || text.hasPrefix(String(prompt.prefix(min(12, prompt.count)))) {
+                return
+            }
+            // Real user words that aren't just the question being read.
+            performBargeIn()
+            return
+        }
+
+        // Energy-only barge-in: AirPods (low TTS bleed). Require strong level + a bit of caption.
+        let usingBluetooth = AVAudioSession.sharedInstance().currentRoute.outputs.contains {
+            [.bluetoothA2DP, .bluetoothHFP, .bluetoothLE].contains($0.portType)
+        }
+        guard usingBluetooth else { return }
+        guard captureBuffer.lastPeak >= speechEnergyThreshold * 2.2 else { return }
+        guard text.count >= 1 || captureBuffer.lastPeak >= speechEnergyThreshold * 3.5 else { return }
+        performBargeIn()
+    }
+
+    private func performBargeIn() {
+        guard promptPlaybackActive, !didBargeIn else { return }
+        didBargeIn = true
+        promptPlaybackActive = false
+        speakGeneration += 1
+        stopCurrentSpeech(resumeContinuation: true)
+        // Fresh WAV from the interrupt point; keep live captions so a mid-prompt
+        // answer doesn't force the user to repeat themselves.
+        captureBuffer.reset()
+        if !lastTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            hasReceivedSpeech = true
+            let now = Date.now
+            firstSpeechDate = firstSpeechDate ?? now
+            lastSpeechDate = now
+            lastTranscriptChangeDate = now
+        }
+        listenStartedAt = .now
+        state = .listening
+        signalMicReady(hapticOnly: true)
     }
 
     private static func normalizeTranscript(_ text: String) -> String {
@@ -665,20 +876,23 @@ final class VoiceManager: NSObject, VoiceManaging {
     // MARK: - Recognition handlers
 
     private func handleAppleRecognition(result: SFSpeechRecognitionResult?, error: Error?) {
+        if isInListenSettle {
+            // Route/HFP settle produces junk partials — ignore until armed.
+            return
+        }
+
         if let result {
             let text = result.bestTranscription.formattedString
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
             if !text.isEmpty {
                 let previous = lastTranscript
-                // Apple re-delivers the same partial while you pause — only treat
-                // real caption growth as "still speaking" (OpenAI-style turn taking).
                 markTranscriptProgress(previous: previous, next: text)
                 partialTranscript = text
                 lastTranscript = text
             }
 
-            if result.isFinal, !usingOpenAISTT {
+            if result.isFinal, !usingOpenAISTT, heardCredibleUtterance {
                 Task { await finalizeListening(preferOpenAI: false) }
             }
         }
@@ -689,7 +903,7 @@ final class VoiceManager: NSObject, VoiceManaging {
                 return
             }
             if listenContinuation != nil, !hasReceivedSpeech { return }
-            if listenContinuation != nil, hasReceivedSpeech, !usingOpenAISTT {
+            if listenContinuation != nil, heardCredibleUtterance, !usingOpenAISTT {
                 Task { await finalizeListening(preferOpenAI: false) }
             }
         }
@@ -706,12 +920,16 @@ final class VoiceManager: NSObject, VoiceManaging {
 
                 let now = Date.now
                 if now.timeIntervalSince(started) >= maxDuration {
-                    await self.finalizeListening(preferOpenAI: self.usingOpenAISTT)
+                    // Timed out with no real speech → empty answer (don't hallucinate).
+                    await self.finalizeListening(preferOpenAI: self.heardCredibleUtterance && self.usingOpenAISTT)
                     return
                 }
 
+                if self.promptPlaybackActive { continue }
+                if self.isInListenSettle { continue }
+
                 let transcript = self.lastTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard self.hasReceivedSpeech, !transcript.isEmpty else { continue }
+                guard self.heardCredibleUtterance, !transcript.isEmpty else { continue }
 
                 let lastSpeech = self.lastSpeechDate ?? self.firstSpeechDate ?? now
                 let firstSpeech = self.firstSpeechDate ?? lastSpeech
@@ -730,13 +948,11 @@ final class VoiceManager: NSObject, VoiceManaging {
                     continue
                 }
 
-                // Primary: caption stopped changing (what users experience as "I finished").
                 if stableFor >= self.transcriptStableTimeout {
                     await self.finalizeListening(preferOpenAI: self.usingOpenAISTT)
                     return
                 }
 
-                // Secondary: clear mic quiet after we've heard something.
                 if spokenFor >= self.minimumSpeechDuration, quietFor >= self.silenceTimeout {
                     await self.finalizeListening(preferOpenAI: self.usingOpenAISTT)
                     return
@@ -749,7 +965,6 @@ final class VoiceManager: NSObject, VoiceManaging {
         guard listenContinuation != nil else {
             return lastTranscript
         }
-        // Prevent double finalize.
         let continuation = listenContinuation
         listenContinuation = nil
         silenceTask?.cancel()
@@ -759,20 +974,36 @@ final class VoiceManager: NSObject, VoiceManaging {
         state = .processing
 
         recognitionRequest?.endAudio()
-        // Keep shared engine + keep-alive running through STT/grade (locked walks).
         removeMicTap()
+        try? audio.restartEngine()
         audio.resumeKeepAliveAfterTTS()
 
-        // Start from Apple live text only — never prefer realtime (often wrong sample rate).
         var text = lastTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !heardCredibleUtterance {
+            // No real utterance — return empty so the session asks again instead of auto-grading.
+            text = ""
+            await realtimeClient?.commit()
+            realtimeClient?.close()
+            realtimeClient = nil
+            tearDownRecognitionHandles()
+            lastTranscript = ""
+            partialTranscript = ""
+            state = .idle
+            continuation?.resume(returning: "")
+            return ""
+        }
+
         await realtimeClient?.commit()
 
-        // When locked / inactive, skip OpenAI STT and trust Apple (often on-device).
         let allowCloudSTT = preferOpenAI && !preferOnDeviceRecognition
-        if allowCloudSTT, let stt = settings.makeOpenAISTTProvider {
+        let strongMic = captureBuffer.maxPeak >= credibleSpeechPeak
+        let appleHasText = !text.isEmpty
+        // Only call cloud STT when we actually captured speech. Quiet WAVs + answer
+        // prompts made gpt-4o-transcribe invent the expected answer.
+        if allowCloudSTT, strongMic || appleHasText, let stt = settings.makeOpenAISTTProvider {
             let wav = captureBuffer.wavData
             let duration = captureBuffer.durationSeconds
-            if duration >= 0.2, wav.count > 2_000 {
+            if duration >= 0.35, wav.count > 4_000, strongMic {
                 let prompt = OpenAITranscriptionProvider.prompt(
                     cardQuestion: sttQuestionHint,
                     expectedAnswer: sttExpectedAnswerHint,
@@ -791,8 +1022,9 @@ final class VoiceManager: NSObject, VoiceManaging {
                         group.cancelAll()
                         return first
                     }
-                    if !precise.isEmpty {
-                        text = precise
+                    let cleaned = precise.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !cleaned.isEmpty, !Self.looksLikePromptHallucination(cleaned, expected: sttExpectedAnswerHint, apple: text) {
+                        text = cleaned
                     }
                 } catch {
                     // Keep Apple transcript.
@@ -809,6 +1041,19 @@ final class VoiceManager: NSObject, VoiceManaging {
         state = .idle
         continuation?.resume(returning: text)
         return text
+    }
+
+    /// If Apple heard nothing meaningful but cloud STT returns the exact expected answer, reject it.
+    private static func looksLikePromptHallucination(_ cloud: String, expected: String, apple: String) -> Bool {
+        let cloudNorm = normalizeTranscript(cloud)
+        let expectedNorm = normalizeTranscript(expected)
+        let appleNorm = normalizeTranscript(apple)
+        guard !expectedNorm.isEmpty, !cloudNorm.isEmpty else { return false }
+        let appleWeak = appleNorm.count < 2
+        let matchesExpected = cloudNorm == expectedNorm
+            || expectedNorm.contains(cloudNorm)
+            || cloudNorm.contains(expectedNorm)
+        return appleWeak && matchesExpected
     }
 
     private func cancelListeningPipeline(resumeListenContinuation: Bool) {
@@ -829,6 +1074,7 @@ final class VoiceManager: NSObject, VoiceManaging {
 
         removeMicTap()
         // Do not stop the shared engine — keep-alive must survive cancel mid-turn.
+        audio.resumeKeepAliveAfterTTS()
 
         if resumeListenContinuation, let continuation = listenContinuation {
             listenContinuation = nil

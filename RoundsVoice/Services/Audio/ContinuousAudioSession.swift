@@ -42,7 +42,9 @@ final class ContinuousAudioSession {
         if engine.isRunning {
             engine.stop()
         }
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        Task.detached(priority: .utility) {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
     }
 
     /// Re-assert session without tearing down (lock → unlock, route blip).
@@ -57,37 +59,88 @@ final class ContinuousAudioSession {
 
     // MARK: - Session
 
-    /// AirPods duplex: HFP via `.allowBluetooth` only — A2DP breaks the mic path.
+    /// Prep output for OpenAI TTS. Keeps `.playAndRecord` (mic tap must be off) and
+    /// prefers A2DP via `.allowBluetoothA2DP` — switching to pure `.playback` was
+    /// killing the audio graph (IPCAUClient -66748) and forcing Apple/Siri fallback.
+    func prepareForTTSPlayback() async throws {
+        if engine.isRunning {
+            engine.stop()
+        }
+        ttsPlayer.stop()
+        if keepAlivePlayer.isPlaying {
+            keepAlivePlayer.pause()
+        }
+
+        try await Task.detached(priority: .userInitiated) {
+            let session = AVAudioSession.sharedInstance()
+            let outputs = session.currentRoute.outputs
+            let usingBluetooth = outputs.contains {
+                [.bluetoothA2DP, .bluetoothHFP, .bluetoothLE].contains($0.portType)
+            }
+
+            if usingBluetooth {
+                try session.setCategory(
+                    .playAndRecord,
+                    mode: .spokenAudio,
+                    options: [.allowBluetoothA2DP, .allowBluetooth, .duckOthers]
+                )
+                try? session.overrideOutputAudioPort(.none)
+            } else {
+                try session.setCategory(
+                    .playAndRecord,
+                    mode: .spokenAudio,
+                    options: [.defaultToSpeaker, .allowBluetoothA2DP, .allowBluetooth, .duckOthers]
+                )
+                try? session.overrideOutputAudioPort(.speaker)
+            }
+            try session.setActive(true, options: [])
+        }.value
+
+        try restartEngine()
+    }
+
+    /// Mic / HFP path for listening — call only after TTS finishes and before installTap.
+    func prepareForListeningCapture() async throws {
+        if engine.isRunning {
+            engine.stop()
+        }
+        ttsPlayer.stop()
+
+        try await configureSession(bounce: false)
+        try restartEngine()
+    }
+
+    /// AirPods duplex listen path: HFP via `.allowBluetooth` (needed for mic).
     func configureSession(bounce: Bool) async throws {
         try await Task.detached(priority: .userInitiated) {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(
-                .playAndRecord,
-                mode: .voiceChat,
-                options: [
-                    .allowBluetooth,
-                    .duckOthers
-                ]
-            )
+            let outputs = session.currentRoute.outputs
+            let usingBluetooth = outputs.contains {
+                [.bluetoothA2DP, .bluetoothHFP, .bluetoothLE].contains($0.portType)
+            }
+
+            if usingBluetooth {
+                try session.setCategory(
+                    .playAndRecord,
+                    mode: .spokenAudio,
+                    options: [.allowBluetooth, .duckOthers]
+                )
+            } else {
+                try session.setCategory(
+                    .playAndRecord,
+                    mode: .spokenAudio,
+                    options: [.defaultToSpeaker, .allowBluetooth, .duckOthers]
+                )
+            }
+
             if bounce {
                 try? session.setActive(false, options: .notifyOthersOnDeactivation)
             }
             try session.setActive(true, options: [])
 
-            let outputs = session.currentRoute.outputs
-            let usingBluetooth = outputs.contains {
-                [.bluetoothA2DP, .bluetoothHFP, .bluetoothLE].contains($0.portType)
-            }
             if usingBluetooth {
                 try? session.overrideOutputAudioPort(.none)
             } else {
-                // Phone speaker for non-BT walks / debugging.
-                try? session.setCategory(
-                    .playAndRecord,
-                    mode: .spokenAudio,
-                    options: [.defaultToSpeaker, .allowBluetooth, .duckOthers]
-                )
-                try session.setActive(true, options: [])
                 try? session.overrideOutputAudioPort(.speaker)
             }
         }.value
@@ -100,13 +153,14 @@ final class ContinuousAudioSession {
 
     private func buildGraphIfNeeded() {
         guard !graphBuilt else { return }
+        // Touch input early so the hardware format exists before we start keep-alive.
+        _ = engine.inputNode
         engine.attach(ttsPlayer)
         engine.attach(keepAlivePlayer)
         engine.attach(earconPlayer)
         engine.connect(ttsPlayer, to: engine.mainMixerNode, format: keepAliveFormat)
         engine.connect(keepAlivePlayer, to: engine.mainMixerNode, format: keepAliveFormat)
         engine.connect(earconPlayer, to: engine.mainMixerNode, format: keepAliveFormat)
-        // Slightly duck keep-alive under real TTS.
         engine.mainMixerNode.outputVolume = 1.0
         graphBuilt = true
     }
@@ -117,6 +171,20 @@ final class ContinuousAudioSession {
             engine.prepare()
             try engine.start()
         }
+        if !ttsPlayer.isPlaying { ttsPlayer.play() }
+        if !earconPlayer.isPlaying { earconPlayer.play() }
+    }
+
+    /// Required after installing/removing an input tap on an already-running engine —
+    /// otherwise the tap often receives zero buffers and STT stays empty.
+    /// Does not restart keep-alive playback (caller decides — muted during listen).
+    func restartEngine() throws {
+        buildGraphIfNeeded()
+        if engine.isRunning {
+            engine.stop()
+        }
+        engine.prepare()
+        try engine.start()
         if !ttsPlayer.isPlaying { ttsPlayer.play() }
         if !earconPlayer.isPlaying { earconPlayer.play() }
     }
@@ -143,7 +211,19 @@ final class ContinuousAudioSession {
     }
 
     func pauseKeepAliveForTTS() {
-        keepAlivePlayer.volume = 0.001
+        keepAlivePlayer.volume = 0
+        if keepAlivePlayer.isPlaying {
+            keepAlivePlayer.pause()
+        }
+    }
+
+    /// Stop keep-alive while the mic is open — recording keeps the session alive,
+    /// and a looping tone can poison STT (AEC / energy threshold).
+    func pauseKeepAliveForListening() {
+        keepAlivePlayer.volume = 0
+        if keepAlivePlayer.isPlaying {
+            keepAlivePlayer.pause()
+        }
     }
 
     func resumeKeepAliveAfterTTS() {
@@ -151,11 +231,14 @@ final class ContinuousAudioSession {
         keepAlivePlayer.volume = 0.02
         if !keepAliveRunning {
             startKeepAlive()
-        } else if !keepAlivePlayer.isPlaying {
-            keepAlivePlayer.play()
+            return
+        }
+        if !keepAlivePlayer.isPlaying {
             if let buffer = Self.nearSilentBuffer(format: keepAliveFormat, seconds: 1.0) {
+                keepAlivePlayer.stop()
                 keepAlivePlayer.scheduleBuffer(buffer, at: nil, options: [.loops])
             }
+            keepAlivePlayer.play()
         }
     }
 

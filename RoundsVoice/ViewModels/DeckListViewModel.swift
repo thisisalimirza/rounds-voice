@@ -73,13 +73,53 @@ final class DeckListViewModel {
     func deleteCard(_ card: Card, context: ModelContext) {
         do {
             if let deck = card.deck {
-                deck.cards.removeAll { $0.id == card.id }
+                DeckStats.noteDeleted(card: card, from: deck)
                 deck.updatedAt = .now
             }
             context.delete(card)
             try context.save()
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    func setSuspended(_ card: Card, suspended: Bool, context: ModelContext) {
+        do {
+            let was = card.isSuspended
+            guard was != suspended else { return }
+            card.isSuspended = suspended
+            card.updatedAt = .now
+            DeckStats.noteSuspensionChanged(card: card, wasSuspended: was)
+            try context.save()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func saveCardEdits(
+        _ card: Card,
+        front: String,
+        back: String,
+        tags: [String],
+        context: ModelContext
+    ) {
+        do {
+            card.front = front
+            card.back = back
+            card.tags = tags
+            card.refreshSearchBlob()
+            card.updatedAt = .now
+            card.deck?.updatedAt = .now
+            try context.save()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func refreshDeckStatsIfNeeded(context: ModelContext) {
+        DeckStats.refreshStaleCounts(context: context)
+        Task {
+            await DeckStats.backfillSearchBlobs(context: context)
         }
     }
 }

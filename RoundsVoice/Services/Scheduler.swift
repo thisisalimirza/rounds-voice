@@ -35,6 +35,7 @@ final class SimplifiedFSRSScheduler: Scheduler {
 
     func recordReview(card: Card, rating: ReviewRating) {
         let now = Date.now
+        let wasDue = card.isDue
         card.lastReviewed = now
         card.reviewCount += 1
         card.updatedAt = now
@@ -71,5 +72,7 @@ final class SimplifiedFSRSScheduler: Scheduler {
             }
             card.dueDate = now.addingTimeInterval(card.interval * 86_400)
         }
+
+        DeckStats.noteReviewScheduled(card: card, wasDue: wasDue)
     }
 }

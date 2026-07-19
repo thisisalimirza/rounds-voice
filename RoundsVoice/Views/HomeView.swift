@@ -16,7 +16,7 @@ struct HomeView: View {
     @State private var renameText = ""
 
     private var totalDue: Int {
-        decks.reduce(0) { $0 + $1.dueCardCount }
+        decks.reduce(0) { $0 + $1.dueCount }
     }
 
     var body: some View {
@@ -168,6 +168,7 @@ struct HomeView: View {
             .toolbarBackground(.hidden, for: .navigationBar)
             .onAppear {
                 viewModel.seedIfNeeded(context: modelContext)
+                viewModel.refreshDeckStatsIfNeeded(context: modelContext)
                 appeared = true
             }
             .alert(
@@ -362,7 +363,7 @@ struct DeckRowView: View {
             Spacer(minLength: 12)
 
             VStack(alignment: .trailing, spacing: 2) {
-                Text("\(deck.dueCardCount)")
+                Text("\(deck.dueCount)")
                     .font(RVTheme.Typography.monoStat)
                     .foregroundStyle(accentWash)
                     .monospacedDigit()

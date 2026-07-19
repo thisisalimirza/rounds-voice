@@ -8,6 +8,7 @@ final class AnswerAudioCapture: @unchecked Sendable {
     private var samples = Data()
     private(set) var sampleRate: Double = 24_000
     private(set) var lastPeak: Float = 0
+    private(set) var maxPeak: Float = 0
 
     var durationSeconds: Double {
         lock.lock()
@@ -27,6 +28,7 @@ final class AnswerAudioCapture: @unchecked Sendable {
         lock.lock()
         samples.removeAll(keepingCapacity: true)
         lastPeak = 0
+        maxPeak = 0
         sampleRate = 24_000
         lock.unlock()
     }
@@ -72,6 +74,7 @@ final class AnswerAudioCapture: @unchecked Sendable {
         }
 
         lastPeak = peak
+        maxPeak = max(maxPeak, peak)
     }
 
     /// PCM slice for realtime streaming (may be native rate — realtime expects 24 kHz;

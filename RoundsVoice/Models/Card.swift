@@ -20,6 +20,10 @@ final class Card {
     /// When set, this card is one step in an AnKing one-by-one / sequential cloze chain.
     var clozeOrdinal: Int?
     var ankiNoteId: String?
+    /// Anki-style suspend — excluded from due counts and review sessions.
+    var isSuspended: Bool = false
+    /// Lowercased plain text for fast SwiftData search predicates (no cloze parsing).
+    var searchBlob: String = ""
     var createdAt: Date
     var updatedAt: Date
 
@@ -41,6 +45,7 @@ final class Card {
         clozeNumber: Int? = nil,
         clozeOrdinal: Int? = nil,
         ankiNoteId: String? = nil,
+        isSuspended: Bool = false,
         deck: Deck? = nil
     ) {
         self.id = id
@@ -58,9 +63,23 @@ final class Card {
         self.clozeNumber = clozeNumber
         self.clozeOrdinal = clozeOrdinal
         self.ankiNoteId = ankiNoteId
+        self.isSuspended = isSuspended
         self.deck = deck
         self.createdAt = .now
         self.updatedAt = .now
+        self.searchBlob = Self.makeSearchBlob(front: front, back: back, tags: tags)
+    }
+
+    func refreshSearchBlob() {
+        searchBlob = Self.makeSearchBlob(front: front, back: back, tags: tags)
+    }
+
+    static func makeSearchBlob(front: String, back: String, tags: [String]) -> String {
+        let plainFront = AnkiHTMLCleaner.plainText(from: front)
+        let plainBack = AnkiHTMLCleaner.plainText(from: back)
+        return ([plainFront, plainBack] + tags)
+            .joined(separator: " ")
+            .lowercased()
     }
 
     /// Text the TTS engine should read (uses the word “blank”).
@@ -113,7 +132,7 @@ final class Card {
     }
 
     var isDue: Bool {
-        dueDate <= .now
+        !isSuspended && dueDate <= .now
     }
 }
 
