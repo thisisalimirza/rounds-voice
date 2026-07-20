@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import UIKit
 
 struct ReviewSessionView: View {
     let deck: Deck
@@ -72,7 +73,18 @@ struct ReviewSessionView: View {
         .preferredColorScheme(.dark)
         .statusBarHidden(false)
         .onAppear { viewModel.start() }
-        .onDisappear { viewModel.stop() }
+        .onDisappear {
+            // SwiftUI's fullScreenCover content can spuriously receive onDisappear
+            // when the app is backgrounded (locking the phone, an incoming call,
+            // Control Center, etc.) even though the presented view hierarchy is
+            // still alive underneath. Locking must never cancel a walking review —
+            // only tear the session down when the user is genuinely leaving while
+            // the app is active. Explicit exits (the X button, permission alert)
+            // call `viewModel.stop()` themselves, so this is a backstop for any
+            // other active-state dismissal, not the primary stop path.
+            guard UIApplication.shared.applicationState == .active else { return }
+            viewModel.stop()
+        }
         .onChange(of: scenePhase) { _, phase in
             // Locking goes to .inactive/.background — keep reviewing.
             // Only re-assert when becoming active again (unlock / return).
@@ -84,10 +96,13 @@ struct ReviewSessionView: View {
             "Permissions needed",
             isPresented: Binding(
                 get: { viewModel.needsPermissions },
-                set: { if !$0 { dismiss() } }
+                set: { if !$0 { viewModel.stop(); dismiss() } }
             )
         ) {
-            Button("Close") { dismiss() }
+            Button("Close") {
+                viewModel.stop()
+                dismiss()
+            }
         } message: {
             Text("Enable Microphone and Speech Recognition in Settings to use walking reviews.")
         }

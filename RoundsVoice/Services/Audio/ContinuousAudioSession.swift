@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import UIKit
 
 /// Keeps `AVAudioSession` + a shared `AVAudioEngine` alive for the whole review so
 /// locked-screen / pocket walks don't get suspended between speak → listen → grade.
@@ -48,12 +49,24 @@ final class ContinuousAudioSession {
     }
 
     /// Re-assert session without tearing down (lock → unlock, route blip).
-    func reassert() async throws {
+    /// Never call while TTS is draining — `setCategory` mid-utterance causes cutouts.
+    func reassert(allowDuringTTS: Bool = false) async throws {
         guard isReviewActive else { return }
+        if !allowDuringTTS, ttsPlayer.isPlaying {
+            try ensureEngineRunning()
+            return
+        }
         try await configureSession(bounce: false)
         try ensureEngineRunning()
         if !keepAliveRunning {
             startKeepAlive()
+        }
+    }
+
+    /// True when the current route is any Bluetooth headset profile.
+    var isBluetoothRoute: Bool {
+        AVAudioSession.sharedInstance().currentRoute.outputs.contains {
+            [.bluetoothA2DP, .bluetoothHFP, .bluetoothLE].contains($0.portType)
         }
     }
 
@@ -99,7 +112,8 @@ final class ContinuousAudioSession {
         try restartEngine()
     }
 
-    /// Mic / HFP path for listening — call only after TTS finishes and before installTap.
+    /// Mic / HFP path for listening — half-duplex only: call after TTS fully finishes.
+    /// This is the intentional A2DP → HFP flip (safe because nothing is speaking).
     func prepareForListeningCapture() async throws {
         if engine.isRunning {
             engine.stop()
@@ -110,7 +124,7 @@ final class ContinuousAudioSession {
         try restartEngine()
     }
 
-    /// AirPods duplex listen path: HFP via `.allowBluetooth` (needed for mic).
+    /// Listen-route session (HFP on Bluetooth). Never call while TTS is playing.
     func configureSession(bounce: Bool) async throws {
         try await Task.detached(priority: .userInitiated) {
             let session = AVAudioSession.sharedInstance()
@@ -218,12 +232,33 @@ final class ContinuousAudioSession {
     }
 
     /// Stop keep-alive while the mic is open — recording keeps the session alive,
-    /// and a looping tone can poison STT (AEC / energy threshold).
+    /// and a looping tone can poison STT (AEC / energy threshold since the input
+    /// tap runs with voice processing disabled).
+    ///
+    /// While the app is foregrounded we still fully mute/pause for best STT quality.
+    /// While locked/backgrounded, a stalled recognizer or a route hiccup between
+    /// mic-tap install and the first captured buffer is exactly the kind of silent
+    /// gap that lets iOS suspend the session — so we leave an ultra-quiet fallback
+    /// tone running as a backstop instead of going fully silent. The tradeoff (a
+    /// faint echo leaking into the mic) is acceptable because locked walks already
+    /// prefer on-device recognition (see `preferOnDeviceRecognition`), which is far
+    /// less sensitive to that than cloud STT.
     func pauseKeepAliveForListening() {
+        guard isAppActive else {
+            keepAlivePlayer.volume = 0.0004
+            if !keepAlivePlayer.isPlaying {
+                keepAlivePlayer.play()
+            }
+            return
+        }
         keepAlivePlayer.volume = 0
         if keepAlivePlayer.isPlaying {
             keepAlivePlayer.pause()
         }
+    }
+
+    private var isAppActive: Bool {
+        UIApplication.shared.applicationState == .active
     }
 
     func resumeKeepAliveAfterTTS() {

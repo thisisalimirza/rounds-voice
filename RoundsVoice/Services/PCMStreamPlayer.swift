@@ -86,6 +86,13 @@ final class PCMStreamPlayer {
                 }
             }
         }
+        // The scheduled buffer's completion handler fires once the render callback
+        // has *consumed* it, not once the audio has actually finished playing out
+        // through the hardware/mixer (and, on Bluetooth, the A2DP codec). Cutting
+        // the node or flipping the session to listen right here clips the last
+        // ~100ms of every prompt — the stutter callers hear at the end of TTS.
+        // Give the tail a brief moment to physically drain first.
+        try? await Task.sleep(for: .milliseconds(120))
         softStop()
     }
 
@@ -145,7 +152,11 @@ final class PCMStreamPlayer {
 
     private func softStop() {
         let player = audio.ttsPlayer
-        if player.isPlaying { player.stop() }
+        // A naturally drained player has nothing left queued by the time we get
+        // here — `.pause()` lets the last render tail settle instead of the harder
+        // cutoff `.stop()` produces, then `.reset()` still leaves the node clean
+        // for the next `start()`.
+        if player.isPlaying { player.pause() }
         player.reset()
         scheduledBuffers = 0
         pending.removeAll(keepingCapacity: false)
