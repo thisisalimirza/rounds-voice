@@ -21,7 +21,7 @@ struct ClozeParserTests {
         #expect(question.contains("blank"))
         #expect(!display.contains("blank"))
         #expect(display.contains("[...]"))
-        #expect(question.contains("D-Ala-D-Ala"))
+        #expect(question.contains("D-Ala-D-Ala") || question.contains("binds"))
         #expect(!question.contains("Vancomycin"))
         #expect(answer == "Vancomycin")
     }
@@ -36,24 +36,64 @@ struct ClozeParserTests {
         #expect(answer == "D-Ala-D-Ala")
     }
 
-    @Test func expandsNoteIntoOneCardPerCloze() {
+    @Test func expandsMultiBlankIntoOneCardPerDeletion() {
         let cards = ClozeParser.expandToCards(
             noteText: "{{c1::Vancomycin}} binds {{c2::D-Ala-D-Ala}}",
             tags: ["antibiotics"],
             deckName: "AnKing Step 1"
         )
         #expect(cards.count == 2)
-        #expect(cards.map(\.clozeNumber) == [1, 2])
+        #expect(cards.map(\.clozeOrdinal) == [0, 1])
         #expect(cards.allSatisfy { $0.cardType == .cloze })
+        // First card: only one spoken blank; second answer omitted from speech.
+        let q0 = cards[0].spokenQuestion
+        #expect(q0.components(separatedBy: "blank").count - 1 == 1)
+        #expect(cards[0].spokenAnswer == "Vancomycin")
+        #expect(cards[1].spokenAnswer == "D-Ala-D-Ala")
+    }
+
+    @Test func sharedClozeNumberIsOneBlankAtATime() {
+        let note = "present with {{c1::hyperthyroidism}}, then {{c1::hypothyroid}} state"
+        let cards = ClozeParser.expandToCards(
+            noteText: note,
+            tags: [],
+            deckName: "AnKing"
+        )
+        #expect(cards.count == 2)
+
+        let display0 = cards[0].displayQuestion
+        #expect(display0.contains("[...]"))
+        #expect(display0.contains("⋯"))
+        #expect(!display0.replacingOccurrences(of: "[...]", with: "").contains("[...]"))
+
+        let spoken0 = cards[0].spokenQuestion
+        #expect(spoken0.components(separatedBy: "blank").count - 1 == 1)
+        #expect(cards[0].spokenAnswer == "hyperthyroidism")
+        #expect(!spoken0.localizedCaseInsensitiveContains("hyperthyroidism"))
+
+        let spoken1 = cards[1].spokenQuestion
+        #expect(spoken1.contains("hyperthyroidism"))
+        #expect(spoken1.components(separatedBy: "blank").count - 1 == 1)
+        #expect(cards[1].spokenAnswer == "hypothyroid")
     }
 
     @Test func supportsClozeHints() {
         let note = "Drug of choice is {{c1::vancomycin::antibiotic}}"
         let question = ClozeParser.spokenQuestion(from: note, clozeNumber: 1)
         let display = ClozeParser.displayQuestion(from: note, clozeNumber: 1)
-        #expect(question.contains("blank (antibiotic)"))
+        #expect(question.contains("blank"))
+        #expect(!question.contains("antibiotic"))
         #expect(display.contains("[antibiotic]"))
         #expect(!display.contains("blank"))
+    }
+
+    @Test func sanitizeSpokenScrubsLeakedMarkup() {
+        let dirty = "May present with {{c1::hyperthyroidism}} then cloze deletion later"
+        let clean = ClozeParser.sanitizeSpoken(dirty)
+        #expect(clean.contains("blank"))
+        #expect(!clean.contains("{{"))
+        #expect(!clean.localizedCaseInsensitiveContains("cloze deletion"))
+        #expect(!clean.contains("hyperthyroidism"))
     }
 }
 

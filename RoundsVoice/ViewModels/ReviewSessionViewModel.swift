@@ -7,6 +7,7 @@ import UIKit
 @MainActor
 final class ReviewSessionViewModel {
     let deck: Deck
+    let studyFilter: StudyFilter
     private let scheduler: any Scheduler
     private let grader: any AIGraderService
     private let voice: any VoiceManaging
@@ -24,18 +25,24 @@ final class ReviewSessionViewModel {
 
     private var sessionTask: Task<Void, Never>?
     private var captionTask: Task<Void, Never>?
+    private var voicePolishTask: Task<Void, Never>?
     private var answerContinuation: CheckedContinuation<String, Never>?
     private var resumeContinuation: CheckedContinuation<Void, Never>?
+    private var cardStartedAt: Date?
+    private var pauseBeganAt: Date?
+    private var didPersistStats = false
     private let nowPlaying = NowPlayingSession.shared
     private let liveActivity = ReviewLiveActivityController.shared
 
     init(
         deck: Deck,
-        scheduler: any Scheduler = SimplifiedFSRSScheduler(),
+        studyFilter: StudyFilter = StudyFilter(),
+        scheduler: any Scheduler = FSRSScheduler(),
         grader: any AIGraderService = HeuristicAnswerGrader(),
         voice: any VoiceManaging
     ) {
         self.deck = deck
+        self.studyFilter = studyFilter
         self.scheduler = scheduler
         self.grader = grader
         self.voice = voice
@@ -62,11 +69,25 @@ final class ReviewSessionViewModel {
         // Never materialize all 40k cards — session queue is a bounded due fetch.
         let sessionLimit = 60
         do {
-            var due = try CardQuery.fetchDue(deckID: deck.id, limit: sessionLimit, context: context)
+            var due = try CardQuery.fetchDue(
+                deckID: deck.id,
+                limit: sessionLimit * 2,
+                context: context,
+                studyFilter: studyFilter
+            )
             if due.isEmpty {
-                due = try CardQuery.fetchUpcoming(deckID: deck.id, limit: min(20, sessionLimit), context: context)
+                due = try CardQuery.fetchUpcoming(
+                    deckID: deck.id,
+                    limit: min(20, sessionLimit) * 2,
+                    context: context,
+                    studyFilter: studyFilter
+                )
             }
-            queue = due
+            // Anki-style: at most one sibling (same note) per session queue snapshot.
+            queue = Array(SiblingBurial.filterQueueRemovingSiblingDuplicates(due).prefix(sessionLimit))
+            for card in queue {
+                card.ensureVoiceScriptReady()
+            }
         } catch {
             queue = []
             errorMessage = error.localizedDescription
@@ -77,18 +98,28 @@ final class ReviewSessionViewModel {
         needsPermissions = false
         liveTranscript = ""
         isSuspended = false
+        cardStartedAt = nil
+        pauseBeganAt = nil
+        didPersistStats = false
         sessionTask?.cancel()
         captionTask?.cancel()
+        voicePolishTask?.cancel()
         finishPendingAnswer(with: "")
         finishResumeWait()
+        // Polish upcoming scripts online — never blocks the first speak.
+        scheduleVoicePolish(from: 0, count: min(40, queue.count))
         sessionTask = Task { await runSession() }
     }
 
     func stop() {
+        endPauseClockIfNeeded()
+        persistStatsIfNeeded()
         sessionTask?.cancel()
         sessionTask = nil
         captionTask?.cancel()
         captionTask = nil
+        voicePolishTask?.cancel()
+        voicePolishTask = nil
         finishPendingAnswer(with: "")
         finishResumeWait()
         voice.cancel()
@@ -133,6 +164,7 @@ final class ReviewSessionViewModel {
     func pauseSession() {
         guard !isSuspended else { return }
         isSuspended = true
+        pauseBeganAt = .now
         voice.pause()
         status = .paused
         publishSessionChrome()
@@ -140,6 +172,7 @@ final class ReviewSessionViewModel {
 
     func resumeSession() {
         guard isSuspended else { return }
+        endPauseClockIfNeeded()
         isSuspended = false
         voice.resume()
         publishSessionChrome()
@@ -185,11 +218,13 @@ final class ReviewSessionViewModel {
             guard let card = queue.first else {
                 status = .finished
                 publishSessionChrome()
+                persistStatsIfNeeded()
                 try? await voice.speak("Session complete. Great work.")
                 break
             }
 
             currentCard = card
+            cardStartedAt = .now
             publishSessionChrome()
             let shouldAdvance = await present(card: card)
             if shouldAdvance {
@@ -197,6 +232,7 @@ final class ReviewSessionViewModel {
             }
         }
 
+        persistStatsIfNeeded()
         voice.endReviewAudio()
         nowPlaying.deactivate()
         liveActivity.end()
@@ -235,8 +271,8 @@ final class ReviewSessionViewModel {
         }
     }
 
-    private func publishSessionChrome() {
-        let detail = sessionDetailText()
+    private func publishSessionChrome(includeTranscript: Bool = false) {
+        let detail = sessionDetailText(includeTranscript: includeTranscript)
         nowPlaying.update(
             deckName: deck.name,
             detail: detail,
@@ -252,12 +288,16 @@ final class ReviewSessionViewModel {
         )
     }
 
-    private func sessionDetailText() -> String {
+    private func sessionDetailText(includeTranscript: Bool = false) -> String {
         switch status {
         case .speaking:
             return currentCard.map { String($0.displayQuestion.prefix(60)) } ?? "Speaking…"
         case .listening:
-            return liveTranscript.isEmpty ? "Speak now…" : liveTranscript
+            // Avoid pushing every partial onto Now Playing / Live Activity — stutter + battery.
+            if includeTranscript, !liveTranscript.isEmpty {
+                return String(liveTranscript.prefix(48))
+            }
+            return "Speak now…"
         case .thinking:
             return "Thinking…"
         case .correct:
@@ -287,17 +327,21 @@ final class ReviewSessionViewModel {
             liveTranscript = ""
             status = .speaking
             publishSessionChrome()
+            card.ensureVoiceScriptReady()
+            let prompt = card.effectiveVoicePrompt
+            let answer = card.effectiveVoiceAnswer
             prefetchNextPrompt(after: card)
+            scheduleVoicePolishAhead(of: card)
             voice.prepareAnswerContext(
-                question: card.spokenQuestion,
-                expectedAnswer: card.spokenAnswer
+                question: prompt,
+                expectedAnswer: answer
             )
 
             startCaptionPolling()
             let transcript: String
             do {
                 transcript = try await voice.speakPromptAndCollectAnswer(
-                    prompt: card.spokenQuestion,
+                    prompt: prompt,
                     maxDuration: 28
                 )
             } catch is CancellationError {
@@ -306,7 +350,7 @@ final class ReviewSessionViewModel {
             } catch {
                 stopCaptionPolling()
                 // Fallback: classic speak-then-listen if combined path fails.
-                try await voice.speak(card.spokenQuestion)
+                try await voice.speak(prompt)
                 transcript = await collectAnswer()
             }
             stopCaptionPolling()
@@ -335,8 +379,8 @@ final class ReviewSessionViewModel {
             status = .thinking
             publishSessionChrome()
             let grade = try await grader.gradeAnswer(
-                question: card.spokenQuestion,
-                expectedAnswer: card.spokenAnswer,
+                question: prompt,
+                expectedAnswer: answer,
                 userAnswer: transcript
             )
             await apply(grade: grade, to: card)
@@ -415,15 +459,19 @@ final class ReviewSessionViewModel {
     private func startCaptionPolling() {
         captionTask?.cancel()
         captionTask = Task { [weak self] in
+            var lastUIPush = Date.distantPast
+            var lastChromePush = Date.distantPast
             while !Task.isCancelled {
                 guard let self else { return }
+                let now = Date.now
                 let partial = self.voice.partialTranscript
-                if partial != self.liveTranscript {
+
+                // Throttle SwiftUI caption updates (~5 Hz) so the orb/atmosphere stay smooth.
+                if partial != self.liveTranscript, now.timeIntervalSince(lastUIPush) >= 0.2 {
                     self.liveTranscript = partial
-                    if self.status == .listening || self.status == .speaking {
-                        self.publishSessionChrome()
-                    }
+                    lastUIPush = now
                 }
+
                 if self.voice.state == .listening, self.status == .speaking {
                     self.status = .listening
                     self.publishSessionChrome()
@@ -432,7 +480,16 @@ final class ReviewSessionViewModel {
                     self.status = .thinking
                     self.publishSessionChrome()
                 }
-                try? await Task.sleep(for: .milliseconds(80))
+
+                // Occasional lock-screen caption refresh — never every partial.
+                if self.status == .listening,
+                   !partial.isEmpty,
+                   now.timeIntervalSince(lastChromePush) >= 0.8 {
+                    self.publishSessionChrome(includeTranscript: true)
+                    lastChromePush = now
+                }
+
+                try? await Task.sleep(for: .milliseconds(160))
             }
         }
     }
@@ -459,7 +516,9 @@ final class ReviewSessionViewModel {
             await waitIfSuspended()
             return false
         case .explain:
-            let explanation = "The expected answer is \(card.spokenAnswer)."
+            card.ensureVoiceScriptReady()
+            let expected = card.effectiveVoiceAnswer
+            let explanation = "The expected answer is \(expected)."
             lastFeedback = explanation
             status = .speaking
             publishSessionChrome()
@@ -475,8 +534,8 @@ final class ReviewSessionViewModel {
             publishSessionChrome()
             do {
                 let grade = try await grader.gradeAnswer(
-                    question: card.spokenQuestion,
-                    expectedAnswer: card.spokenAnswer,
+                    question: card.effectiveVoicePrompt,
+                    expectedAnswer: expected,
                     userAnswer: transcript
                 )
                 await apply(grade: grade, to: card)
@@ -492,12 +551,24 @@ final class ReviewSessionViewModel {
     }
 
     private func apply(grade: GradeResult, to card: Card) async {
-        let expected = card.spokenAnswer
+        card.ensureVoiceScriptReady()
+        let expected = card.effectiveVoiceAnswer
         let revealed = AnswerMatching.ensureAnswerRevealed(grade, expected: expected)
-        let rating = ReviewRating(from: revealed)
+        let rating = ReviewRating(from: revealed, responseLatency: voice.lastResponseLatency)
         scheduler.recordReview(card: card, rating: rating)
+
+        // Bury sister cloze cards until tomorrow so you don't grind the same note.
+        if let context = deck.modelContext {
+            _ = SiblingBurial.burySiblings(of: card, queue: &queue, context: context)
+        }
+
         deck.lastReviewedAt = .now
-        stats.record(grade: revealed)
+        let cardSeconds: TimeInterval = {
+            guard let started = cardStartedAt else { return 0 }
+            return max(0, Date.now.timeIntervalSince(started))
+        }()
+        stats.record(grade: revealed, cardSeconds: cardSeconds)
+        cardStartedAt = nil
         lastFeedback = revealed.feedback
         status = revealed.isCorrect ? .correct : .incorrect
         publishSessionChrome()
@@ -510,14 +581,60 @@ final class ReviewSessionViewModel {
         try? await Task.sleep(for: .milliseconds(revealed.isCorrect ? 350 : 700))
     }
 
+    private func endPauseClockIfNeeded() {
+        guard let began = pauseBeganAt else { return }
+        stats.pausedSeconds += max(0, Date.now.timeIntervalSince(began))
+        pauseBeganAt = nil
+    }
+
+    private func persistStatsIfNeeded() {
+        guard !didPersistStats else { return }
+        endPauseClockIfNeeded()
+        guard stats.cardsCompleted > 0 else { return }
+        didPersistStats = true
+        _ = StudyStatsStore.saveSession(
+            deck: deck,
+            stats: stats,
+            context: deck.modelContext
+        )
+    }
+
     private func prefetchNextPrompt(after card: Card) {
         guard let index = queue.firstIndex(where: { $0.id == card.id }),
               index + 1 < queue.count
         else { return }
-        voice.prefetchSpeech(queue[index + 1].spokenQuestion)
+        let next = queue[index + 1]
+        next.ensureVoiceScriptReady()
+        voice.prefetchSpeech(next.effectiveVoicePrompt)
         // Prefetch one more when possible for locked walks with flaky network.
         if index + 2 < queue.count {
-            voice.prefetchSpeech(queue[index + 2].spokenQuestion)
+            let after = queue[index + 2]
+            after.ensureVoiceScriptReady()
+            voice.prefetchSpeech(after.effectiveVoicePrompt)
         }
+    }
+
+    private func scheduleVoicePolishAhead(of card: Card) {
+        guard let index = queue.firstIndex(where: { $0.id == card.id }) else { return }
+        scheduleVoicePolish(from: index + 1, count: 10)
+    }
+
+    /// Background LLM polish for a slice of the queue. Never awaits on the speak path.
+    private func scheduleVoicePolish(from start: Int, count: Int) {
+        guard start < queue.count, count > 0 else { return }
+        guard let context = deck.modelContext else { return }
+        let end = min(start + count, queue.count)
+        let slice = Array(queue[start..<end])
+        guard !slice.isEmpty else { return }
+
+        // Fire-and-forget; do not cancel earlier queue polish (already-LLM cards are skipped).
+        let task = Task { @MainActor in
+            await VoiceScriptService.polishIfNeeded(
+                cards: slice,
+                provider: AppSettings.shared.makeLLMProvider,
+                context: context
+            )
+        }
+        voicePolishTask = task
     }
 }

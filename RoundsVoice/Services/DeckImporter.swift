@@ -445,6 +445,8 @@ enum DeckPersistence {
         for card in cards {
             card.imageAttachments = note.imageAttachments
             card.deck = deck
+            // Baseline only — never LLM-polish 40k cards at import.
+            VoiceScriptBaseline.apply(to: card)
             // Avoid `deck.cards.append` — that materializes the full relationship in RAM.
             context.insert(card)
             DeckStats.noteInserted(card: card, into: deck)

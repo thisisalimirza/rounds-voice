@@ -12,7 +12,7 @@ struct RoundsVoiceApp: App {
         _ = ContinuousAudioSession.shared
 
         do {
-            let schema = Schema([Deck.self, Card.self])
+            let schema = Schema([Deck.self, Card.self, StudySessionSummary.self])
             let configuration = ModelConfiguration(
                 schema: schema,
                 isStoredInMemoryOnly: false

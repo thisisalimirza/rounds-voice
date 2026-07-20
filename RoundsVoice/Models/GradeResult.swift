@@ -54,12 +54,27 @@ enum ReviewRating: String, Codable, Sendable, CaseIterable {
     case good
     case easy
 
-    init(from grade: GradeResult) {
-        if grade.isCorrect {
-            self = grade.confidence >= 0.9 ? .easy : .good
-        } else {
+    /// Prefer Again / Good. Hard = correct but slow. Easy = correct and immediate.
+    init(from grade: GradeResult, responseLatency: TimeInterval? = nil) {
+        guard grade.isCorrect else {
             self = .again
+            return
         }
+
+        // Easy: first real words almost immediately after the mic is ready.
+        if let latency = responseLatency, latency > 0, latency <= 2.5 {
+            self = .easy
+            return
+        }
+
+        // Hard: got it right, but it took a long time to produce an answer.
+        if let latency = responseLatency, latency >= 14 {
+            self = .hard
+            return
+        }
+
+        // Default correct path — the common case.
+        self = .good
     }
 }
 

@@ -101,33 +101,55 @@ struct AtmosphereBackground: View {
             )
             .ignoresSafeArea()
 
-            // Fine grain — stable pseudo-random field (no per-frame flicker)
-            GeometryReader { geo in
-                Canvas { context, size in
-                    var generator = SeededGenerator(seed: 42)
-                    let count = Int((size.width * size.height) / 2800)
-                    for _ in 0..<count {
-                        let x = CGFloat.random(in: 0..<size.width, using: &generator)
-                        let y = CGFloat.random(in: 0..<size.height, using: &generator)
-                        let rect = CGRect(x: x, y: y, width: 1.1, height: 1.1)
-                        context.fill(
-                            Path(ellipseIn: rect),
-                            with: .color(.primary.opacity(scheme == .dark ? 0.045 : 0.035))
-                        )
-                    }
-                }
-                .frame(width: geo.size.width, height: geo.size.height)
-            }
-            .ignoresSafeArea()
-            .allowsHitTesting(false)
-            .opacity(0.65)
+            // Flattened grain — avoids re-running thousands of Canvas fills on every invalidation.
+            GrainOverlay(dark: scheme == .dark)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+                .opacity(0.55)
         }
     }
 }
 
+private struct GrainOverlay: View {
+    let dark: Bool
+
+    var body: some View {
+        Canvas { context, size in
+            var generator = SeededGenerator(seed: 42)
+            let count = Int((size.width * size.height) / 4200)
+            for _ in 0..<count {
+                let x = CGFloat.random(in: 0..<size.width, using: &generator)
+                let y = CGFloat.random(in: 0..<size.height, using: &generator)
+                let rect = CGRect(x: x, y: y, width: 1.0, height: 1.0)
+                context.fill(
+                    Path(ellipseIn: rect),
+                    with: .color(.primary.opacity(dark ? 0.04 : 0.03))
+                )
+            }
+        }
+        .drawingGroup()
+    }
+}
+
 struct StatusAtmosphere: View {
-    let tint: Color
+    /// Prefer phase over Color so we don't animate on every tint identity change.
+    var phase: ReviewSessionStatus? = nil
+    var tint: Color = RVTheme.seafoam
     @Environment(\.colorScheme) private var scheme
+
+    private var resolvedTint: Color {
+        guard let phase else { return tint }
+        switch phase {
+        case .listening: return RVTheme.listening
+        case .speaking: return RVTheme.seafoamBright
+        case .thinking: return RVTheme.thinking
+        case .correct: return RVTheme.correct
+        case .incorrect: return RVTheme.incorrect
+        case .paused: return RVTheme.copper
+        case .finished: return RVTheme.seafoamBright
+        case .idle: return RVTheme.seafoam
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -135,13 +157,13 @@ struct StatusAtmosphere: View {
                 .ignoresSafeArea()
 
             RadialGradient(
-                colors: [tint.opacity(scheme == .dark ? 0.28 : 0.16), .clear],
+                colors: [resolvedTint.opacity(scheme == .dark ? 0.28 : 0.16), .clear],
                 center: UnitPoint(x: 0.5, y: 0.38),
                 startRadius: 10,
                 endRadius: 340
             )
             .ignoresSafeArea()
-            .animation(.easeInOut(duration: 0.55), value: tint)
+            .animation(.easeInOut(duration: 0.32), value: phase ?? .idle)
 
             RadialGradient(
                 colors: [
@@ -157,67 +179,68 @@ struct StatusAtmosphere: View {
     }
 }
 
-// MARK: - Breathing voice orb
+// MARK: - Breathing voice orb (GPU-cheap)
 
+/// No live blur, no animated shadow radius — TimelineView sine instead of stacked repeatForever.
 struct BreathingOrb: View {
     let tint: Color
     let symbol: String
     let isActive: Bool
-    @State private var breathe = false
-    @State private var ring = false
 
     var body: some View {
-        ZStack {
-            // Outer rings
-            ForEach(0..<3, id: \.self) { i in
+        TimelineView(.animation(minimumInterval: isActive ? 1.0 / 30.0 : 1.0 / 6.0, paused: false)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            let breathe = isActive ? (0.5 + 0.5 * sin(t * 2.1)) : 0.3
+            let ring = isActive ? (0.5 + 0.5 * sin(t * 1.55)) : 0.15
+            let coreScale = 0.98 + 0.035 * breathe
+            let glowScale = 0.95 + 0.07 * breathe
+            let ringScale = 0.97 + 0.045 * ring
+
+            ZStack {
+                ForEach(0..<2, id: \.self) { i in
+                    Circle()
+                        .stroke(tint.opacity(0.11 - Double(i) * 0.03), lineWidth: 1)
+                        .frame(width: 168 + CGFloat(i) * 40, height: 168 + CGFloat(i) * 40)
+                        .scaleEffect(ringScale + CGFloat(i) * 0.015)
+                        .opacity(isActive ? 0.9 : 0.4)
+                }
+
+                // Soft glow without blur (blur+scale was the main stutter source).
                 Circle()
-                    .stroke(tint.opacity(0.12 - Double(i) * 0.03), lineWidth: 1)
-                    .frame(width: 168 + CGFloat(i) * 36, height: 168 + CGFloat(i) * 36)
-                    .scaleEffect(ring ? 1.04 + CGFloat(i) * 0.02 : 0.96)
-                    .opacity(isActive ? 1 : 0.45)
-            }
-
-            // Soft glow
-            Circle()
-                .fill(
-                    RadialGradient(
-                        colors: [tint.opacity(0.35), tint.opacity(0.08), .clear],
-                        center: .center,
-                        startRadius: 10,
-                        endRadius: 110
+                    .fill(
+                        RadialGradient(
+                            colors: [tint.opacity(0.34), tint.opacity(0.10), .clear],
+                            center: .center,
+                            startRadius: 8,
+                            endRadius: 108
+                        )
                     )
-                )
-                .frame(width: 220, height: 220)
-                .scaleEffect(breathe ? 1.08 : 0.92)
-                .blur(radius: 8)
+                    .frame(width: 210, height: 210)
+                    .scaleEffect(glowScale)
+                    .opacity(isActive ? 1 : 0.55)
 
-            // Core
-            Circle()
-                .fill(
-                    LinearGradient(
-                        colors: [tint.opacity(0.95), tint.opacity(0.7)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [tint.opacity(0.95), tint.opacity(0.7)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
                     )
-                )
-                .frame(width: 108, height: 108)
-                .shadow(color: tint.opacity(0.45), radius: breathe ? 28 : 14, y: 8)
-                .scaleEffect(breathe ? 1.04 : 0.98)
+                    .frame(width: 108, height: 108)
+                    .shadow(color: tint.opacity(isActive ? 0.42 : 0.22), radius: 16, y: 6)
+                    .scaleEffect(coreScale)
 
-            Image(systemName: symbol)
-                .font(.system(size: 36, weight: .medium))
-                .foregroundStyle(RVTheme.bone)
-                .symbolEffect(.variableColor.iterative, isActive: isActive)
-        }
-        .frame(height: 280)
-        .onAppear {
-            withAnimation(.easeInOut(duration: 2.4).repeatForever(autoreverses: true)) {
-                breathe = true
+                Image(systemName: symbol)
+                    .font(.system(size: 36, weight: .medium))
+                    .foregroundStyle(RVTheme.bone)
+                    .contentTransition(.symbolEffect(.replace))
             }
-            withAnimation(.easeInOut(duration: 3.2).repeatForever(autoreverses: true)) {
-                ring = true
-            }
+            .frame(height: 260)
         }
+        .compositingGroup()
+        .animation(.easeInOut(duration: 0.25), value: isActive)
+        .animation(.easeInOut(duration: 0.25), value: symbol)
     }
 }
 

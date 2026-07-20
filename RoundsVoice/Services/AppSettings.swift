@@ -103,6 +103,16 @@ final class AppSettings {
         }
     }
 
+    /// Shared chat provider for voice-script polish (nil when no key).
+    var makeLLMProvider: (any LLMProvider)? {
+        guard hasOpenAIKey else { return nil }
+        return OpenAIProvider(
+            apiKey: openAIAPIKey,
+            model: openAIModel,
+            projectID: openAIProjectID
+        )
+    }
+
     var makeOpenAITTSProvider: OpenAITTSProvider? {
         guard shouldUseOpenAITTS else { return nil }
         return OpenAITTSProvider(

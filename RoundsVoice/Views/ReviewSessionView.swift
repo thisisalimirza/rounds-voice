@@ -4,6 +4,7 @@ import UIKit
 
 struct ReviewSessionView: View {
     let deck: Deck
+    let studyFilter: StudyFilter
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var scheme
     @Environment(\.scenePhase) private var scenePhase
@@ -12,11 +13,13 @@ struct ReviewSessionView: View {
     @State private var showBridge = false
     @FocusState private var bridgeFocused: Bool
 
-    init(deck: Deck) {
+    init(deck: Deck, studyFilter: StudyFilter = StudyFilter()) {
         self.deck = deck
+        self.studyFilter = studyFilter
         _viewModel = State(
             initialValue: ReviewSessionViewModel(
                 deck: deck,
+                studyFilter: studyFilter,
                 grader: AppSettings.shared.makeGrader,
                 voice: VoiceManager()
             )
@@ -25,7 +28,7 @@ struct ReviewSessionView: View {
 
     var body: some View {
         ZStack {
-            StatusAtmosphere(tint: statusTint)
+            StatusAtmosphere(phase: viewModel.status)
 
             VStack(spacing: 0) {
                 topBar
@@ -39,18 +42,19 @@ struct ReviewSessionView: View {
                     symbol: micSymbol,
                     isActive: viewModel.status == .listening || viewModel.status == .speaking
                 )
-                .animation(.easeInOut(duration: 0.4), value: viewModel.status)
+                // Don't implicit-animate the whole orb tree on every status flip.
+                .transaction { $0.animation = nil }
 
                 statusBlock
                     .padding(.horizontal, RVTheme.Spacing.xl)
                     .padding(.top, RVTheme.Spacing.sm)
 
-                if viewModel.status == .listening, !viewModel.liveTranscript.isEmpty {
-                    liveCaption
-                        .padding(.horizontal, RVTheme.Spacing.xl)
-                        .padding(.top, RVTheme.Spacing.md)
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
-                }
+                // Reserved slot — opacity only (no insert/remove layout thrash).
+                liveCaption
+                    .padding(.horizontal, RVTheme.Spacing.xl)
+                    .padding(.top, RVTheme.Spacing.md)
+                    .opacity(showLiveCaption ? 1 : 0)
+                    .accessibilityHidden(!showLiveCaption)
 
                 Spacer(minLength: 12)
 
@@ -61,7 +65,7 @@ struct ReviewSessionView: View {
                     phase1Bridge
                         .padding(.horizontal, RVTheme.Spacing.lg)
                         .padding(.top, RVTheme.Spacing.md)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .transition(.opacity)
                 }
 
                 controls
@@ -119,23 +123,28 @@ struct ReviewSessionView: View {
         }
     }
 
+    private var showLiveCaption: Bool {
+        viewModel.status == .listening && !viewModel.liveTranscript.isEmpty
+    }
+
     private var liveCaption: some View {
-        Text(viewModel.liveTranscript)
+        Text(viewModel.liveTranscript.isEmpty ? " " : viewModel.liveTranscript)
             .font(RVTheme.Typography.bodySoft)
             .foregroundStyle(RVTheme.bone.opacity(0.75))
             .multilineTextAlignment(.center)
+            .lineLimit(3)
             .padding(.horizontal, 18)
             .padding(.vertical, 12)
-            .frame(maxWidth: 340)
+            .frame(maxWidth: 340, minHeight: 44)
             .background {
                 Capsule(style: .continuous)
                     .fill(Color.white.opacity(0.08))
                     .overlay {
                         Capsule(style: .continuous)
-                            .strokeBorder(statusTint.opacity(0.35), lineWidth: 1)
+                            .strokeBorder(RVTheme.listening.opacity(0.35), lineWidth: 1)
                     }
             }
-            .animation(.easeOut(duration: 0.15), value: viewModel.liveTranscript)
+            // Never animate on every partial token — that was a major stutter source.
     }
 
     private var topBar: some View {
@@ -158,10 +167,16 @@ struct ReviewSessionView: View {
                 Text(viewModel.deckTitle)
                     .font(RVTheme.Typography.headline)
                     .foregroundStyle(RVTheme.bone)
-                Text("WALKING REVIEW")
+                Text(viewModel.studyFilter.isEmpty ? "WALKING REVIEW" : "TAG FILTER")
                     .font(RVTheme.Typography.overline)
                     .tracking(1.8)
                     .foregroundStyle(RVTheme.seafoamBright.opacity(0.9))
+                if !viewModel.studyFilter.isEmpty {
+                    Text(viewModel.studyFilter.summary)
+                        .font(.caption2)
+                        .foregroundStyle(RVTheme.bone.opacity(0.55))
+                        .lineLimit(1)
+                }
             }
 
             Spacer()
@@ -189,7 +204,7 @@ struct ReviewSessionView: View {
                 .font(RVTheme.Typography.status)
                 .foregroundStyle(statusTint)
                 .contentTransition(.opacity)
-                .animation(.easeInOut(duration: 0.25), value: viewModel.status)
+                .animation(.easeInOut(duration: 0.2), value: viewModel.status)
 
             if let card = viewModel.currentCard {
                 Text(card.displayQuestion)

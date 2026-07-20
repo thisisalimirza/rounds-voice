@@ -5,6 +5,7 @@ struct HomeView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.colorScheme) private var colorScheme
     @Query(sort: \Deck.name) private var decks: [Deck]
+    @Query(sort: \StudySessionSummary.endedAt, order: .reverse) private var sessions: [StudySessionSummary]
     @State private var viewModel = DeckListViewModel()
     @State private var appeared = false
     @State private var showSettings = false
@@ -14,9 +15,16 @@ struct HomeView: View {
     @State private var deckPendingDelete: Deck?
     @State private var deckPendingRename: Deck?
     @State private var renameText = ""
+    @State private var showCreateDeck = false
+    @State private var newDeckName = ""
+    @State private var newDeckDescription = ""
 
     private var totalDue: Int {
         decks.reduce(0) { $0 + $1.dueCount }
+    }
+
+    private var todayStats: StudyStats.Snapshot {
+        StudyStats.aggregate(sessions: Array(sessions), since: StudyStats.startOfToday())
     }
 
     var body: some View {
@@ -63,6 +71,17 @@ struct HomeView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     HStack(spacing: 10) {
+                        NavigationLink {
+                            StatsView()
+                        } label: {
+                            Image(systemName: "chart.bar")
+                                .font(.body.weight(.medium))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 32, height: 32)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .accessibilityLabel("Stats")
+
                         Button {
                             showImporter = true
                         } label: {
@@ -85,6 +104,11 @@ struct HomeView: View {
                         }
 
                         Menu {
+                            Button("New Deck", systemImage: "folder.badge.plus") {
+                                newDeckName = ""
+                                newDeckDescription = ""
+                                showCreateDeck = true
+                            }
                             Button("Import Anki .apkg", systemImage: "square.and.arrow.down") {
                                 showImporter = true
                             }
@@ -197,6 +221,20 @@ struct HomeView: View {
                     deckPendingRename = nil
                 }
             }
+            .alert("New deck", isPresented: $showCreateDeck) {
+                TextField("Deck name", text: $newDeckName)
+                TextField("Description (optional)", text: $newDeckDescription)
+                Button("Create") {
+                    _ = viewModel.createDeck(
+                        name: newDeckName,
+                        description: newDeckDescription,
+                        context: modelContext
+                    )
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Create an empty deck, then add cards or move cards into it.")
+            }
             .confirmationDialog(
                 "Delete deck?",
                 isPresented: Binding(
@@ -264,21 +302,55 @@ struct HomeView: View {
     }
 
     private var dueRibbon: some View {
-        HStack(alignment: .lastTextBaseline, spacing: 10) {
-            Text("\(totalDue)")
-                .font(RVTheme.Typography.brandSmall)
-                .foregroundStyle(RVTheme.seafoam)
-                .contentTransition(.numericText())
-            VStack(alignment: .leading, spacing: 2) {
-                Text("cards due")
-                    .font(RVTheme.Typography.headline)
-                Text("across \(decks.count) decks")
-                    .font(RVTheme.Typography.caption)
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .lastTextBaseline, spacing: 10) {
+                Text("\(totalDue)")
+                    .font(RVTheme.Typography.brandSmall)
+                    .foregroundStyle(RVTheme.seafoam)
+                    .contentTransition(.numericText())
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("cards due")
+                        .font(RVTheme.Typography.headline)
+                    Text("across \(decks.count) decks")
+                        .font(RVTheme.Typography.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
             }
-            Spacer()
+
+            if todayStats.cardsStudied > 0 {
+                NavigationLink {
+                    StatsView()
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "chart.bar.fill")
+                            .foregroundStyle(RVTheme.seafoam)
+                        Text("Today · \(todayStats.cardsStudied) cards · \(todayStats.accuracyPercent)% · \(formatAvg(todayStats.averageSecondsPerCard))/card")
+                            .font(RVTheme.Typography.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.right")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color.primary.opacity(colorScheme == .dark ? 0.05 : 0.04))
+                    }
+                }
+                .buttonStyle(.plain)
+            }
         }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
+    }
+
+    private func formatAvg(_ seconds: Double) -> String {
+        guard seconds > 0 else { return "—" }
+        if seconds < 60 { return String(format: "%.0fs", seconds) }
+        return String(format: "%d:%02d", Int(seconds) / 60, Int(seconds) % 60)
     }
 
     private var emptyState: some View {

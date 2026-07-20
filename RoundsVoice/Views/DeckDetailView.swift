@@ -162,17 +162,32 @@ struct DeckDetailView: View {
     }
 
     private var manageRow: some View {
-        NavigationLink {
+        manageLink(
+            title: "Browse deck",
+            subtitle: "Search, tags, select all, suspend, move, study",
+            systemImage: "rectangle.stack"
+        ) {
             CardBrowserView(deck: deck)
+        }
+    }
+
+    private func manageLink<Destination: View>(
+        title: String,
+        subtitle: String,
+        systemImage: String,
+        @ViewBuilder destination: () -> Destination
+    ) -> some View {
+        NavigationLink {
+            destination()
         } label: {
             HStack(spacing: 12) {
-                Image(systemName: "rectangle.stack")
+                Image(systemName: systemImage)
                     .foregroundStyle(RVTheme.seafoam)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Browse & manage cards")
+                    Text(title)
                         .font(RVTheme.Typography.headline)
                         .foregroundStyle(.primary)
-                    Text("Search, edit, suspend, delete")
+                    Text(subtitle)
                         .font(RVTheme.Typography.caption)
                         .foregroundStyle(.secondary)
                 }

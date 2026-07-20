@@ -5,6 +5,10 @@ struct ReviewSessionStats: Sendable, Equatable {
     var cardsCompleted: Int = 0
     var correctCount: Int = 0
     var startedAt: Date = .now
+    /// Accumulated pause time so stats don't count coffee breaks.
+    var pausedSeconds: TimeInterval = 0
+    /// Sum of per-card durations (present → graded).
+    var totalCardSeconds: TimeInterval = 0
 
     var accuracy: Double {
         guard cardsCompleted > 0 else { return 0 }
@@ -16,13 +20,24 @@ struct ReviewSessionStats: Sendable, Equatable {
     }
 
     var elapsed: TimeInterval {
-        Date.now.timeIntervalSince(startedAt)
+        max(0, Date.now.timeIntervalSince(startedAt) - pausedSeconds)
     }
 
-    mutating func record(grade: GradeResult) {
+    var averageSecondsPerCard: Double {
+        guard cardsCompleted > 0 else { return 0 }
+        if totalCardSeconds > 0 {
+            return totalCardSeconds / Double(cardsCompleted)
+        }
+        return elapsed / Double(cardsCompleted)
+    }
+
+    mutating func record(grade: GradeResult, cardSeconds: TimeInterval = 0) {
         cardsCompleted += 1
         if grade.isCorrect {
             correctCount += 1
+        }
+        if cardSeconds > 0 {
+            totalCardSeconds += cardSeconds
         }
     }
 }

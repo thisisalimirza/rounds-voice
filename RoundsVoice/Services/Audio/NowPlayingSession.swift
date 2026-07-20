@@ -17,6 +17,9 @@ final class NowPlayingSession {
     var onRemote: ((RemoteAction) -> Void)?
 
     private var commandsInstalled = false
+    private var lastTitle = ""
+    private var lastAlbum = ""
+    private var lastPlaying: Bool?
 
     private init() {}
 
@@ -32,6 +35,9 @@ final class NowPlayingSession {
 
     func deactivate() {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        lastTitle = ""
+        lastAlbum = ""
+        lastPlaying = nil
         let center = MPRemoteCommandCenter.shared()
         center.playCommand.removeTarget(nil)
         center.pauseCommand.removeTarget(nil)
@@ -44,8 +50,16 @@ final class NowPlayingSession {
 
     func update(deckName: String, detail: String, isPlaying: Bool) {
         installCommandsIfNeeded()
+        let title = String(detail.prefix(80))
+        // Skip identical updates — caption thrash was hammering MPNowPlayingInfoCenter.
+        if title == lastTitle, deckName == lastAlbum, lastPlaying == isPlaying {
+            return
+        }
+        lastTitle = title
+        lastAlbum = deckName
+        lastPlaying = isPlaying
         let info: [String: Any] = [
-            MPMediaItemPropertyTitle: String(detail.prefix(80)),
+            MPMediaItemPropertyTitle: title,
             MPMediaItemPropertyArtist: "Rounds Voice",
             MPMediaItemPropertyAlbumTitle: deckName,
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
